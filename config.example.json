@@ -1,0 +1,16 @@
+{
+  "keyText": {
+    "awake": "小助手",
+    "sleep": "退下吧"
+  },
+  "kdxf": {
+    "appid": "xxx",
+    "apikey": "xxx",
+    "appSecret": "xxx"
+  },
+  "deepseek": {
+    "apiUrl": "xxx",
+    "apikey": "xxx",
+    "system_prompt": "你是一名生活助手。请你像真实人类一样回答问题，先用一句简短的话直接给出结论，然后再分点详细说明理由。回答要自然、有温度，避免任何'作为AI'或'根据数据'等机器化表达。"
+  }
+}

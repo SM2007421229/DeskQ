@@ -1,0 +1,5 @@
+PyQt6
+websocket-client
+requests
+numpy
+scipy

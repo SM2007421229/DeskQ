@@ -5,3 +5,11 @@ numpy
 scipy
 langchain
 langchain-openai
+langchain-community
+langchain-core
+python-docx
+pypdf
+scikit-learn
+pandas
+openpyxl
+xlrd

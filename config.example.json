@@ -13,5 +13,12 @@
     "apiUrl": "xxx",
     "apikey": "xxx",
     "system_prompt": "你是一名生活助手。请你像真实人类一样回答问题，先用一句简短的话直接给出结论，然后再分点详细说明理由。回答要自然、有温度，避免任何'作为AI'或'根据数据'等机器化表达。"
+  },
+  "file_knowledge": {
+    "monitored_folders": [
+      "C:\\Users\\Administrator\\Desktop"
+    ],
+    "file_types": [".docx", ".doc", ".xlsx", ".xls", ".pdf", ".txt", ".md", ".jpg", ".png", ".mp3", ".mp4", ".wav", ".exe", ".lnk"],
+    "reindex_interval": 3600
   }
 }

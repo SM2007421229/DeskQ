@@ -5,6 +5,8 @@ import re
 import datetime
 import json
 import threading
+import time
+
 import numpy as np
 import scipy.signal
 import scipy.io.wavfile
@@ -13,6 +15,8 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel,
 from PyQt6.QtCore import QProcess, QThread, pyqtSignal
 import asr
 import llm
+import file_manager
+from langchain_core.tools import StructuredTool
 
 class AudioListener(QThread):
     finished_recording = pyqtSignal(str)
@@ -142,6 +146,7 @@ class AudioListener(QThread):
 
 class AudioRecorder(QWidget):
     update_chat_signal = pyqtSignal(str)
+    update_status_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -154,17 +159,22 @@ class AudioRecorder(QWidget):
         self.listener = None
         self.is_awake = False
         
+        # 初始化文件管理器
+        self.file_manager = file_manager.FileManager(self.config)
+        
         # 初始化 大模型 助手
         llm_config = self.config.get('llm', {})
         self.ai_assistant = llm.chat(
             api_key=llm_config.get('apikey'),
             api_url=llm_config.get('apiUrl'),
             system_prompt=llm_config.get('system_prompt', ''),
-            model=llm_config.get('model')
+            model=llm_config.get('model'),
+            file_manager_instance=self.file_manager
         )
         
         # 绑定问答界面更新事件
         self.update_chat_signal.connect(self.append_chat)
+        self.update_status_signal.connect(self.status_label.setText)
         
         # 如果设备可用，自动开始监听
         if self.device_combo.count() > 0:
@@ -203,6 +213,10 @@ class AudioRecorder(QWidget):
         self.restart_btn.clicked.connect(self.start_listening)
         layout.addWidget(self.restart_btn)
 
+        self.update_kb_btn = QPushButton("更新文件知识库")
+        self.update_kb_btn.clicked.connect(self.update_knowledge_base)
+        layout.addWidget(self.update_kb_btn)
+
         self.status_label = QLabel("正在初始化...")
         layout.addWidget(self.status_label)
         
@@ -211,6 +225,24 @@ class AudioRecorder(QWidget):
         layout.addWidget(self.chat_display)
 
         self.setLayout(layout)
+
+        
+    def update_knowledge_base(self):
+        self.status_label.setText("正在更新知识库...")
+        threading.Thread(target=self._run_manual_update).start()
+
+    def _run_manual_update(self):
+        self.file_manager.index_files()
+        print("Manual update triggered.")
+        self.update_status_signal.emit("知识库更新完毕")
+        
+        # 恢复监听状态显示
+        time.sleep(1)
+        if self.listener and self.listener.is_running:
+            device_name = self.device_combo.currentText()
+            self.update_status_signal.emit(f"正在监听: {device_name}")
+        else:
+            self.update_status_signal.emit("就绪")
 
     def load_devices(self):
         devices = self.get_audio_devices()

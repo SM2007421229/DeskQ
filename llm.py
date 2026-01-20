@@ -4,7 +4,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 
-class DeepSeekChat:
+class chat:
     def __init__(self, api_key, api_url, system_prompt, model="deepseek-v3-250324"):
         # 处理 API URL，LangChain/OpenAI SDK 通常需要 Base URL (不带 /chat/completions)
         if api_url and api_url.endswith("/chat/completions"):

@@ -3,12 +3,12 @@
     "awake": "小助手",
     "sleep": "退下吧"
   },
-  "kdxf": {
+  "asr": {
     "appid": "xxx",
     "apikey": "xxx",
     "appSecret": "xxx"
   },
-  "deepseek": {
+  "llm": {
     "model": "xxx",
     "apiUrl": "xxx",
     "apikey": "xxx",

@@ -11,8 +11,8 @@ import scipy.io.wavfile
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel, 
                              QComboBox, QPushButton, QMessageBox, QTextEdit)
 from PyQt6.QtCore import QProcess, QThread, pyqtSignal
-import Audio2TxT
-import deepseek
+import asr
+import llm
 
 class AudioListener(QThread):
     finished_recording = pyqtSignal(str)
@@ -154,13 +154,13 @@ class AudioRecorder(QWidget):
         self.listener = None
         self.is_awake = False
         
-        # 初始化 DeepSeek 助手
-        ds_config = self.config.get('deepseek', {})
-        self.ai_assistant = deepseek.DeepSeekChat(
-            api_key=ds_config.get('apikey'),
-            api_url=ds_config.get('apiUrl'),
-            system_prompt=ds_config.get('system_prompt', ''),
-            model=ds_config.get('model')
+        # 初始化 大模型 助手
+        llm_config = self.config.get('llm', {})
+        self.ai_assistant = llm.chat(
+            api_key=llm_config.get('apikey'),
+            api_url=llm_config.get('apiUrl'),
+            system_prompt=llm_config.get('system_prompt', ''),
+            model=llm_config.get('model')
         )
         
         # 绑定问答界面更新事件
@@ -285,18 +285,18 @@ class AudioRecorder(QWidget):
 
     def process_audio(self, audio_path):
         print(f"Starting recognition for {audio_path}")
-        kdxf_config = self.config.get('kdxf', {})
-        appid = kdxf_config.get('appid')
-        apikey = kdxf_config.get('apikey')
-        appsecret = kdxf_config.get('appSecret')
+        asr_config = self.config.get('asr', {})
+        appid = asr_config.get('appid')
+        apikey = asr_config.get('apikey')
+        appsecret = asr_config.get('appSecret')
 
         if not (appid and apikey and appsecret):
-            print("Error: Missing KDXF config")
+            print("语音识别配置错误")
             self.delete_audio(audio_path)
             return
 
         try:
-            text = Audio2TxT.recognize_with_xfyun(audio_path, appid, apikey, appsecret)
+            text = asr.recognize_with_xfyun(audio_path, appid, apikey, appsecret)
             print(f"识别结果: {text}")
             
             # 在识别后立即删除音频
@@ -315,22 +315,22 @@ class AudioRecorder(QWidget):
             if awake_word and awake_word in text:
                 self.is_awake = True
                 self.play_audio(os.path.join(os.getcwd(), 'records', 'here.mp3'))
-                self.update_chat_signal.emit(f"User: {text}")
-                self.update_chat_signal.emit(f"System: 唤醒成功")
+                self.update_chat_signal.emit(f"用户: {text}")
+                self.update_chat_signal.emit(f"系统消息: 唤醒成功\n")
                 return
             elif sleep_word and sleep_word in text:
                 self.is_awake = False
                 self.play_audio(os.path.join(os.getcwd(), 'records', 'exit.mp3'))
-                self.update_chat_signal.emit(f"User: {text}")
-                self.update_chat_signal.emit(f"System: 进入休眠")
+                self.update_chat_signal.emit(f"用户: {text}")
+                self.update_chat_signal.emit(f"系统消息: 进入休眠")
                 return
 
-            # DeepSeek 交互
+            # 大模型 交互
             if self.is_awake:
-                self.update_chat_signal.emit(f"User: {text}")
+                self.update_chat_signal.emit(f"提问: {text}")
                 
                 try:
-                    self.update_chat_signal.emit("DeepSeek: ") # 新行起始
+                    self.update_chat_signal.emit("回答: ") # 新行起始
                     
                     # 使用 self.ai_assistant 进行流式对话，session_id 固定为 "user_main_session"
                     generator = self.ai_assistant.ask_stream(text, session_id="user_main_session")
@@ -341,7 +341,7 @@ class AudioRecorder(QWidget):
                     self.update_chat_signal.emit("\n") # 消息结束
                     
                 except Exception as e:
-                    print(f"\nDeepSeek error: {e}")
+                    print(f"\n小助手发生错误: {e}")
                     self.update_chat_signal.emit(f"Error: {e}")
                 
         except Exception as e:

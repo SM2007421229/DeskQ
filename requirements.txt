@@ -3,3 +3,5 @@ websocket-client
 requests
 numpy
 scipy
+langchain
+langchain-openai

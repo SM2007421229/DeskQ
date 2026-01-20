@@ -153,8 +153,15 @@ class AudioRecorder(QWidget):
         
         self.listener = None
         self.is_awake = False
-        # 历史问答记录
-        self.history = []
+        
+        # 初始化 DeepSeek 助手
+        ds_config = self.config.get('deepseek', {})
+        self.ai_assistant = deepseek.DeepSeekChat(
+            api_key=ds_config.get('apikey'),
+            api_url=ds_config.get('apiUrl'),
+            system_prompt=ds_config.get('system_prompt', ''),
+            model=ds_config.get('model')
+        )
         
         # 绑定问答界面更新事件
         self.update_chat_signal.connect(self.append_chat)
@@ -322,25 +329,17 @@ class AudioRecorder(QWidget):
             if self.is_awake:
                 self.update_chat_signal.emit(f"User: {text}")
                 
-                ds_config = self.config.get('deepseek', {})
-                api_url = ds_config.get('apiUrl')
-                api_key = ds_config.get('apikey')
-                system_prompt = ds_config.get('system_prompt', '')
-                
-                full_answer = ""
                 try:
                     self.update_chat_signal.emit("DeepSeek: ") # 新行起始
                     
-                    generator = deepseek.ask_stream(system_prompt, text, self.history, api_key, api_url)
-                    current_response = ""
+                    # 使用 self.ai_assistant 进行流式对话，session_id 固定为 "user_main_session"
+                    generator = self.ai_assistant.ask_stream(text, session_id="user_main_session")
+                    
                     for chunk in generator:
-                        current_response += chunk
                         self.update_chat_signal.emit(f"[STREAM]{chunk}") # 流式传输的特殊前缀
                     
                     self.update_chat_signal.emit("\n") # 消息结束
                     
-                    # 更新历史记录
-                    self.history.append({'question': text, 'answer': current_response})
                 except Exception as e:
                     print(f"\nDeepSeek error: {e}")
                     self.update_chat_signal.emit(f"Error: {e}")

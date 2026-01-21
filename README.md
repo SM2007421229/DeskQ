@@ -29,20 +29,23 @@ cd DeskQ
 2. 填写配置文件
 > 把 config.example.json 复制为 config.json，并按下方说明填入你的密钥：
    
-| 字段 | 说明 | 如何获取/备注 |
-| :--- | :--- | :--- |
-| `keyText.awake` | 语音唤醒词 | 可自定义，如 `"你好 DeskQ"` |
-| `keyText.sleep` | 语音休眠词 | 可自定义 |
-| `asr.appid` | 科大讯飞开放平台 AppID | [讯飞控制台](https://console.xfyun.cn/) → 创建应用 |
-| `asr.apikey` | 讯飞 API Key | 语音听写API Key |
-| `asr.appSecret` | 讯飞 AppSecret | 语音听写API Secret |
-| `llm.model` | 模型名称 | 如 `deepseek-v3-250324` |
-| `llm.apiUrl` | 大模型接口地址 | 如火山方舟调用地址 |
-| `llm.apikey` | 大模型 API Key | 对应平台的 API Key |
-| `llm.system_prompt` | 人设提示词 | 已内置，可按需调整 |
-| `file_knowledge.monitored_folders` | 知识库监控文件夹 | 列表格式，填入本地文件夹绝对路径 |
-| `file_knowledge.file_types` | 支持的文件后缀 | 列表格式，如 `[".pdf", ".docx", ".xlsx"]` |
-| `file_knowledge.reindex_interval` | 自动重新索引间隔 | 单位：秒，默认 3600 |
+| 字段                                 | 说明             | 如何获取/备注                                   |
+|:-----------------------------------|:---------------|:------------------------------------------|
+| `keyText.awake`                    | 语音唤醒词          | 可自定义，如 `"你好 DeskQ"`                       |
+| `keyText.sleep`                    | 语音休眠词          | 可自定义                                      |
+| `asr.appid`                        | 科大讯飞开放平台 AppID | [讯飞控制台](https://console.xfyun.cn/) → 创建应用 |
+| `asr.apikey`                       | 讯飞 API Key     | 语音听写API Key                               |
+| `asr.appSecret`                    | 讯飞 AppSecret   | 语音听写API Secret                            |
+| `llm.model`                        | 模型名称           | 如 `deepseek-v3-250324`                    |
+| `llm.apiUrl`                       | 大模型接口地址        | 如火山方舟调用地址                                 |
+| `llm.apikey`                       | 大模型 API Key    | 对应平台的 API Key                             |
+| `llm.system_prompt`                | 人设提示词          | 已内置，可按需调整                                 |
+| `vector.host`                      | 向量数据库地址        | 内置ES                                      |
+| `vector.user`                      | 向量数据库用户名       | 内置ES                                      |
+| `vector.password`                  | 向量数据库密码        | 内置ES                                      |
+| `file_knowledge.monitored_folders` | 知识库监控文件夹       | 列表格式，填入本地文件夹绝对路径                          |
+| `file_knowledge.file_types`        | 支持的文件后缀        | 列表格式，如 `[".pdf", ".docx", ".xlsx"]`       |
+| `file_knowledge.reindex_interval`  | 自动重新索引间隔       | 单位：秒，默认 3600                              |
 
 3. 安装依赖并启动
 ```bash

@@ -13,3 +13,4 @@ scikit-learn
 pandas
 openpyxl
 xlrd
+elasticsearch<8.0.0

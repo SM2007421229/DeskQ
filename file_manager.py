@@ -3,7 +3,14 @@ import time
 import threading
 from datetime import datetime
 import pandas as pd
-from vector_store import SimpleVectorDB
+from elasticsearch import Elasticsearch
+
+try:
+    from sklearn.feature_extraction.text import HashingVectorizer
+    from sklearn.preprocessing import normalize
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 # Optional imports for file reading
 try:
@@ -25,8 +32,48 @@ class FileManager:
         self.file_types = set(self.config.get('types', self.config.get('file_types', [])))
         self.reindex_interval = self.config.get('watch_interval', self.config.get('reindex_interval', 3600))
 
-        print("Initializing Vector Database (SimpleVectorDB)...")
-        self.collection = SimpleVectorDB(collection_name="file_index")
+        # ES Config
+        vector_config = config.get('vector', {})
+        self.es_host = vector_config.get('host', "http://localhost:9200")
+        self.es_user = vector_config.get('user')
+        self.es_password = vector_config.get('password')
+        self.index_name = "deskq_files"
+        self.vector_dim = 1024
+        
+        print(f"Initializing Elasticsearch at {self.es_host}...")
+        try:
+            es_args = {
+                "hosts": [self.es_host],
+                "timeout": 30
+            }
+            
+            if self.es_user and self.es_password:
+                print(f"Using Basic Auth with user: {self.es_user}")
+                # For elasticsearch<8.0.0, use http_auth
+                es_args["http_auth"] = (self.es_user, self.es_password)
+                
+            self.es = Elasticsearch(**es_args)
+            if not self.es.ping():
+                print(f"Warning: Could not connect to Elasticsearch at {self.es_host}")
+        except Exception as e:
+            print(f"Error connecting to Elasticsearch: {e}")
+            self.es = None
+
+        if HAS_SKLEARN:
+            # Use HashingVectorizer to create dense vectors via hashing + normalization
+            # Note: This is a lightweight way to get embeddings without a heavy ML model
+            self.vectorizer = HashingVectorizer(
+                n_features=self.vector_dim,
+                analyzer='char_wb',
+                ngram_range=(2, 4),
+                norm=None,
+                alternate_sign=False
+            )
+        else:
+            print("Warning: scikit-learn not found. Vector search will fail.")
+            self.vectorizer = None
+
+        self._init_es_index()
         
         self.is_indexing = False
         self.running = True
@@ -36,6 +83,39 @@ class FileManager:
         if config.get('auto_index', True):
             self.thread = threading.Thread(target=self._auto_reindex_loop, daemon=True)
             self.thread.start()
+
+    def _init_es_index(self):
+        if not self.es:
+            return
+            
+        try:
+            if not self.es.indices.exists(index=self.index_name):
+                mapping = {
+                    "mappings": {
+                        "properties": {
+                            "name": {"type": "text"},
+                            "path": {"type": "keyword"},
+                            "ext": {"type": "keyword"},
+                            "embedding": {
+                                "type": "dense_vector",
+                                "dims": self.vector_dim
+                            },
+                            "created_at": {"type": "date"}
+                        }
+                    }
+                }
+                self.es.indices.create(index=self.index_name, body=mapping)
+                print(f"Created Elasticsearch index: {self.index_name}")
+        except Exception as e:
+            print(f"Error creating index: {e}")
+
+    def _vectorize(self, text):
+        if not self.vectorizer:
+            return [0.0] * self.vector_dim
+        X = self.vectorizer.transform([text])
+        # L2 normalization to ensure cosine similarity works as expected
+        X = normalize(X.toarray(), norm='l2')
+        return X[0].tolist()
 
     def _auto_reindex_loop(self):
         while self.running:
@@ -70,9 +150,27 @@ class FileManager:
                             }
             
             # 2. Get existing files in Vector Store
-            existing_data = self.collection.get()
-            existing_ids = set(existing_data["ids"])
-            
+            existing_ids = set()
+            if self.es:
+                try:
+                    # Scan all documents to get current IDs
+                    # Note: For very large indices, use helpers.scan
+                    resp = self.es.search(
+                        index=self.index_name,
+                        body={
+                            "query": {"match_all": {}},
+                            "_source": ["path"],
+                            "size": 10000 
+                        }
+                    )
+                    for hit in resp['hits']['hits']:
+                         # Use path as ID or retrieve from source
+                         path = hit['_source'].get('path')
+                         if path:
+                             existing_ids.add(path)
+                except Exception as e:
+                    print(f"Error fetching existing files from ES: {e}")
+
             # 3. Calculate Diff
             files_on_disk_ids = set(current_files.keys())
             
@@ -83,22 +181,60 @@ class FileManager:
             to_delete_ids = list(existing_ids - files_on_disk_ids)
             
             # 4. Apply Updates
-            if to_delete_ids:
+            if to_delete_ids and self.es:
                 print(f"Removing {len(to_delete_ids)} deleted files from index...")
-                self.collection.delete(ids=to_delete_ids)
+                # Delete by query is safer or bulk delete
+                # Since we use path as ID logic (but maybe not _id), let's delete by term
+                # Ideally we should use path as _id to make this easier.
+                # For now, let's assume we search and delete.
+                # Actually, using delete_by_query is good.
+                try:
+                    # Batch delete might be tricky with terms query limit (65k).
+                    # Loop chunks if needed.
+                    chunk_size = 1000
+                    for i in range(0, len(to_delete_ids), chunk_size):
+                        chunk = to_delete_ids[i:i+chunk_size]
+                        self.es.delete_by_query(
+                            index=self.index_name,
+                            body={"query": {"terms": {"path": chunk}}}
+                        )
+                except Exception as e:
+                     print(f"Error deleting files: {e}")
                 
-            if to_add_ids:
+            if to_add_ids and self.es:
                 print(f"Adding {len(to_add_ids)} new files to index...")
-                # SimpleVectorDB handles batching internally if needed, but we pass all at once here
-                batch_ids = to_add_ids
-                batch_documents = [current_files[id]["name"] for id in batch_ids]
-                batch_metadatas = [current_files[id] for id in batch_ids]
+                from elasticsearch import helpers
                 
-                self.collection.add(
-                    documents=batch_documents,
-                    metadatas=batch_metadatas,
-                    ids=batch_ids
-                )
+                actions = []
+                for file_path in to_add_ids:
+                    meta = current_files[file_path]
+                    vector = self._vectorize(meta['name'])
+                    
+                    doc = {
+                        "_index": self.index_name,
+                        # Use path as _id to ensure uniqueness and easy access
+                        # However, path might contain chars invalid for some ID contexts, but usually fine.
+                        # Base64 encoding path as ID is safer, but raw path is readable.
+                        # Let's rely on ES autogen ID or just search by path.
+                        # Using path as ID allows upserts easily.
+                        # Let's NOT force _id=path to avoid issues, just rely on path field uniqueness via logic.
+                        # But wait, to check existing_ids efficiently, _id is best.
+                        # Let's stick to the logic: we query all paths, so we know what to add/delete.
+                        "_source": {
+                            "name": meta['name'],
+                            "path": meta['path'],
+                            "ext": meta['ext'],
+                            "embedding": vector,
+                            "created_at": datetime.now().isoformat()
+                        }
+                    }
+                    actions.append(doc)
+                
+                if actions:
+                    try:
+                        helpers.bulk(self.es, actions)
+                    except Exception as e:
+                         print(f"Error bulk indexing: {e}")
             
             print(f"[{datetime.now().strftime('%H:%M:%S')}] File index completed. Total files: {len(files_on_disk_ids)} (+{len(to_add_ids)}, -{len(to_delete_ids)})")
             
@@ -118,35 +254,72 @@ class FileManager:
                 query = query.get('query', '') or query.get('text', '') or ''
             
             if not query or (isinstance(query, str) and not query.strip()):
-                # Return all files (or top 50 to avoid overflow)
-                all_data = self.collection.get()
-                if not all_data['ids']:
-                     return "知识库为空。"
+                if not self.es:
+                    return "Elasticsearch 未连接。"
                 
-                output = ["知识库文件列表 (前 50 个):"]
-                for i, meta in enumerate(all_data['metadatas']):
-                    if i >= 50:
-                        output.append(f"... 等 {len(all_data['ids']) - 50} 个更多文件")
-                        break
-                    output.append(f"- {meta['name']} (Path: {meta['path']})")
-                return "\n".join(output)
+                # Return all files (or top 50 to avoid overflow)
+                try:
+                    resp = self.es.search(
+                        index=self.index_name,
+                        body={
+                            "query": {"match_all": {}},
+                            "size": 50,
+                            "_source": ["name", "path"]
+                        }
+                    )
+                    hits = resp['hits']['hits']
+                    if not hits:
+                        return "知识库为空。"
+                    
+                    output = ["知识库文件列表 (前 50 个):"]
+                    for i, hit in enumerate(hits):
+                        source = hit['_source']
+                        output.append(f"- {source['name']} (Path: {source['path']})")
+                    
+                    total = resp['hits']['total']['value']
+                    if total > 50:
+                        output.append(f"... 等 {total - 50} 个更多文件")
+                    return "\n".join(output)
+                except Exception as e:
+                    return f"查询出错: {e}"
 
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=20
+            if not self.es:
+                return "Elasticsearch 未连接。"
+
+            # Vector Search
+            query_vector = self._vectorize(query)
+            
+            # ES 7.x script_score query
+            # Note: cosineSimilarity requires doc['embedding']
+            script_query = {
+                "script_score": {
+                    "query": {"match_all": {}},
+                    "script": {
+                        "source": "cosineSimilarity(params.query_vector, doc['embedding']) + 1.0",
+                        "params": {"query_vector": query_vector}
+                    }
+                }
+            }
+            
+            resp = self.es.search(
+                index=self.index_name,
+                body={
+                    "query": script_query,
+                    "size": 20,
+                    "_source": ["name", "path"]
+                }
             )
             
-            if not results['ids'] or not results['ids'][0]:
+            hits = resp['hits']['hits']
+            if not hits:
                 return "未找到匹配的文件。"
             
             output = []
-            ids = results['ids'][0]
-            metadatas = results['metadatas'][0]
-            distances = results['distances'][0]
-            
-            for i, (id, meta, dist) in enumerate(zip(ids, metadatas, distances)):
-                # dist is cosine distance (1 - similarity). Lower is better.
-                output.append(f"{meta['name']} (Path: {meta['path']})")
+            for hit in hits:
+                source = hit['_source']
+                score = hit['_score']
+                # Score is cosine+1, so range 0-2. Higher is better.
+                output.append(f"{source['name']} (Path: {source['path']})")
                 
             return "\n".join(output)
             
@@ -154,15 +327,40 @@ class FileManager:
             return f"搜索出错: {str(e)}"
 
     def _find_best_match(self, query):
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=1
-        )
-        
-        if not results['ids'] or not results['ids'][0]:
+        if not self.es:
             return None
             
-        return results['metadatas'][0][0]
+        try:
+            query_vector = self._vectorize(query)
+            
+            script_query = {
+                "script_score": {
+                    "query": {"match_all": {}},
+                    "script": {
+                        "source": "cosineSimilarity(params.query_vector, doc['embedding']) + 1.0",
+                        "params": {"query_vector": query_vector}
+                    }
+                }
+            }
+            
+            resp = self.es.search(
+                index=self.index_name,
+                body={
+                    "query": script_query,
+                    "size": 1,
+                    "_source": ["name", "path", "ext"]
+                }
+            )
+            
+            hits = resp['hits']['hits']
+            if not hits:
+                return None
+            
+            return hits[0]['_source']
+            
+        except Exception as e:
+            print(f"Error finding best match: {e}")
+            return None
 
     def open_file(self, file_name_query):
         try:

@@ -16,6 +16,8 @@ from PyQt6.QtWebChannel import QWebChannel
 import asr
 import llm
 import file_manager
+import tts
+
 
 # 设置 QtWebEngine 禁用 GPU 加速，解决 0xC0000409 崩溃问题
 os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
@@ -302,6 +304,8 @@ class AudioRecorder(QWidget):
         self.listener = None
         self.is_awake = False
         self.current_device_name = None
+        self.ai_response_buffer = "" # 缓存AI回答
+        self.tts_triggered = False # 是否已触发TTS
 
         # 读取配置文件
         self.config = self.load_config()
@@ -476,8 +480,22 @@ class AudioRecorder(QWidget):
 
         # Dispatch to appropriate JS function
         if text.startswith("[STREAM]"):
-            chunk = text[8:].replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n').replace('\r', '')
-            self.web_view.page().runJavaScript(f"appendAiStream('{chunk}');")
+            chunk = text[8:]
+            
+            # 累积文本并检查是否需要触发TTS
+            self.ai_response_buffer += chunk
+            
+            if not self.tts_triggered and '\n' in self.ai_response_buffer:
+                first_sentence = self.ai_response_buffer.split('\n')[0].strip()
+                if first_sentence:
+                    self.tts_triggered = True
+                    print(f"Triggering TTS for summary: {first_sentence}")
+                    threading.Thread(target=self.run_tts, args=(first_sentence,)).start()
+            
+            # 转义字符以供 JS 使用
+            js_chunk = chunk.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n').replace('\r', '')
+            self.web_view.page().runJavaScript(f"appendAiStream('{js_chunk}');")
+            
         elif text.startswith("提问: "):
             content = text[4:].replace('\\', '\\\\').replace("'", "\\'")
             self.web_view.page().runJavaScript(f"addUserMessage('{content}');")
@@ -485,6 +503,8 @@ class AudioRecorder(QWidget):
             content = text[4:].replace('\\', '\\\\').replace("'", "\\'")
             self.web_view.page().runJavaScript(f"addUserMessage('{content}');")
         elif text == "回答: ":
+            self.ai_response_buffer = "" # 重置缓冲区
+            self.tts_triggered = False # 重置TTS触发状态
             self.web_view.page().runJavaScript("startAiMessage();")
         elif text == "\n":
             self.web_view.page().runJavaScript("endAiMessage();")
@@ -496,6 +516,15 @@ class AudioRecorder(QWidget):
             self.handle_status_update(content)
         elif text.startswith("Error: "):
             self.handle_status_update(text)
+
+    def run_tts(self, text):
+        # 使用配置文件中的 key，如果不存在则使用默认值
+        asr_config = self.config.get('asr', {})
+        app_id = asr_config.get('appid', '0e0f71f1')
+        api_key = asr_config.get('apikey', 'fdeebb4ad3414ce3d9ea703dc2a7369a')
+        api_secret = asr_config.get('appSecret', 'M2ZhN2NmOTU5MTk5YTAzNjNlYTY1MDFi')
+        
+        tts.run_tts_task(text, app_id, api_key, api_secret)
 
     def update_knowledge_base(self):
         self.update_status_signal.emit("正在更新知识库...")

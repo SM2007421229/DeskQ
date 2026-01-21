@@ -14,3 +14,4 @@ pandas
 openpyxl
 xlrd
 elasticsearch<8.0.0
+PyQt6-WebEngine

@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>桌面语音助手 UI 原型</title>
+    <style>
+        :root {
+            /* 暗色模式配色 */
+            --primary-color: #818cf8; /* Indigo 400 */
+            --primary-dark: #4f46e5; /* Indigo 600 */
+            --bg-color: #0f172a; /* Slate 900 */
+            --chat-bg: #1e293b; /* Slate 800 */
+            --text-primary: #f1f5f9; /* Slate 100 */
+            --text-secondary: #94a3b8; /* Slate 400 */
+            
+            --user-bubble-bg: #4f46e5; /* Indigo 600 */
+            --user-text: #ffffff;
+            
+            --ai-bubble-bg: #334155; /* Slate 700 */
+            --ai-summary-bg: #312e81; /* Indigo 900 */
+            --ai-summary-text: #e0e7ff; /* Indigo 100 */
+            --ai-summary-border: #4338ca; /* Indigo 700 */
+            
+            --border-radius: 16px;
+            --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
+            --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.3), 0 2px 4px -2px rgb(0 0 0 / 0.3);
+            --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.3), 0 4px 6px -2px rgb(0 0 0 / 0.3);
+        }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-color);
+            margin: 0;
+            padding: 0;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            color: var(--text-primary);
+        }
+
+        .app-container {
+            width: 100%;
+            height: 100%;
+            background-color: var(--chat-bg);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            position: relative;
+        }
+
+        /* 顶部标题栏 */
+        .header {
+            padding: 16px 24px;
+            background: rgba(30, 41, 59, 0.85); /* Slate 800 transparent */
+            border-bottom: 1px solid #334155;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            backdrop-filter: blur(8px);
+            z-index: 10;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .header-title {
+            font-size: 18px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--text-primary);
+        }
+
+        .status-badge {
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            background-color: #059669; /* Emerald 600 */
+            color: #ecfdf5; /* Emerald 50 */
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .device-select {
+            background-color: rgba(30, 41, 59, 0.5);
+            color: var(--text-secondary);
+            border: 1px solid #334155;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 12px;
+            outline: none;
+            max-width: 150px;
+        }
+
+        .device-select:focus {
+            border-color: var(--primary-color);
+            color: var(--text-primary);
+        }
+
+        .btn-update {
+            background-color: transparent;
+            border: 1px solid var(--primary-color);
+            color: var(--primary-color);
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .btn-update:hover {
+            background-color: rgba(129, 140, 248, 0.1);
+        }
+
+        /* 聊天区域 */
+        .chat-area {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+            padding-bottom: 100px; /* 为悬浮按钮留出空间 */
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+            scroll-behavior: smooth;
+        }
+
+        /* 消息行容器 */
+        .message-row {
+            display: flex;
+            gap: 12px;
+            max-width: 85%;
+            animation: fadeIn 0.3s ease-out;
+        }
+
+        .message-row.user {
+            align-self: flex-end;
+            flex-direction: row-reverse;
+        }
+
+        .message-row.ai {
+            align-self: flex-start;
+        }
+
+        /* 头像 */
+        .avatar {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            background-color: #334155;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            font-size: 13px;
+            border: 1px solid #475569;
+            margin-top: 2px;
+        }
+
+        .avatar.user {
+            background-color: var(--primary-dark);
+            color: white;
+            border: none;
+        }
+
+        .avatar.ai {
+            background: linear-gradient(135deg, #4f46e5, #7c3aed);
+            color: white;
+            border: none;
+        }
+
+        /* 消息气泡基础样式 */
+        .bubble {
+            padding: 6px 12px;
+            border-radius: var(--border-radius);
+            position: relative;
+            font-size: 12px;
+            line-height: 1.6;
+            box-shadow: var(--shadow-sm);
+        }
+
+        /* 用户气泡 */
+        .user .bubble {
+            background-color: var(--user-bubble-bg);
+            color: var(--user-text);
+            border-bottom-right-radius: 4px;
+        }
+
+        /* AI 气泡 (复合结构) */
+        .ai .bubble-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            width: 100%;
+        }
+
+        /* AI 总结部分 (第一句) */
+        .ai-summary-card {
+            background-color: var(--ai-summary-bg);
+            border: 1px solid var(--ai-summary-border);
+            color: var(--ai-summary-text);
+            padding: 6px 12px;
+            border-radius: 16px;
+            font-weight: 600;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .ai-summary-icon {
+            font-size: 18px;
+            margin-top: 0;
+            display: flex;
+            align-items: center;
+        }
+
+        /* AI 详细部分 */
+        .ai-detail-card {
+            background-color: var(--ai-bubble-bg);
+            color: var(--text-primary);
+            padding: 10px 12px;
+            border-radius: 16px;
+            border-top-left-radius: 4px;
+            font-size: 12px;
+            border: 1px solid #475569;
+        }
+
+        .ai-detail-card p {
+            margin: 8px 0;
+        }
+        .ai-detail-card p:first-child {
+            margin-top: 0;
+        }
+        .ai-detail-card ul, .ai-detail-card ol {
+            padding-left: 18px;
+            margin: 6px 0;
+        }
+        .ai-detail-card li {
+            margin-bottom: 4px;
+        }
+        .ai-detail-card blockquote {
+            margin: 8px 0;
+            padding-left: 10px;
+            border-left: 3px solid #475569;
+            color: #94a3b8;
+        }
+        
+        /* 代码块样式适配暗色 */
+        code {
+            background-color: #0f172a;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: Consolas, Monaco, 'Andale Mono', monospace;
+            color: #e2e8f0;
+            border: 1px solid #334155;
+        }
+
+        /* 底部悬浮麦克风 */
+        .floating-mic-container {
+            position: absolute;
+            bottom: 30px;
+            left: 0;
+            right: 0;
+            display: flex;
+            justify-content: center;
+            pointer-events: none; /* 让点击穿透到下方，除了按钮本身 */
+        }
+
+        .btn-mic {
+            width: 64px;
+            height: 64px;
+            border-radius: 50%;
+            border: none;
+            background-color: var(--primary-dark);
+            color: white;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 10px 25px -5px rgba(79, 70, 229, 0.5);
+            pointer-events: auto; /* 恢复按钮点击 */
+        }
+
+        .btn-mic:hover {
+            transform: scale(1.1);
+            background-color: #4338ca;
+        }
+
+        .btn-mic.recording {
+            background-color: #ef4444;
+            box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+            animation: pulse-red 1.5s infinite;
+        }
+
+        /* 动画 */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes pulse-red {
+            0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            70% { transform: scale(1.1); box-shadow: 0 0 0 15px rgba(239, 68, 68, 0); }
+            100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+
+        /* 滚动条美化 (Dark) */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #475569;
+            border-radius: 4px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: #64748b;
+        }
+
+    </style>
+</head>
+<body>
+
+    <div class="app-container">
+        <!-- 顶部 -->
+        <div class="header">
+            <div class="header-left">
+                <div class="header-title">
+                    <span id="assistantIcon" style="font-size: 20px;">💤</span> 桌面语音助手
+                </div>
+                <select id="micSelect" class="device-select" title="选择麦克风设备">
+                    <option value="">加载设备中...</option>
+                </select>
+                <div class="status-badge">● 监听中</div>
+            </div>
+            
+            <button class="btn-update" onclick="alert('触发更新知识库...')">
+                <span style="font-size: 14px;">↻</span> 更新知识库
+            </button>
+        </div>
+
+        <!-- 聊天区 -->
+        <div class="chat-area" id="chatArea">
+            
+            <!-- 欢迎消息 -->
+            <div class="message-row ai">
+                <div class="avatar ai">AI</div>
+                <div class="bubble-container">
+                    <div class="ai-summary-card">
+                        <span class="ai-summary-icon">👋</span>
+                        <span>你好！我是你的智能桌面助手。</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 填充底部空间，确保内容不被麦克风遮挡 -->
+            <div style="height: 20px;"></div>
+
+        </div>
+    </div>
+
+    <script src="js/qwebchannel.js"></script>
+    <script src="js/marked.min.js"></script>
+    <script>
+        let backend = null;
+        
+        // Initialize WebChannel
+        new QWebChannel(qt.webChannelTransport, function(channel) {
+            backend = channel.objects.backend;
+        });
+
+        // Chat helper functions
+        const chatArea = document.getElementById('chatArea');
+
+        function scrollToBottom() {
+            chatArea.scrollTop = chatArea.scrollHeight;
+        }
+
+        function createMessageRow(role) {
+            const row = document.createElement('div');
+            row.className = `message-row ${role}`;
+            
+            const avatar = document.createElement('div');
+            avatar.className = `avatar ${role}`;
+            avatar.textContent = role === 'user' ? '我' : 'AI';
+            
+            row.appendChild(avatar);
+            
+            if (role === 'user') {
+                // User: Avatar is last (flex-direction: row-reverse handled by CSS)
+            } else {
+                // AI: Avatar is first
+            }
+            
+            return { row, avatar };
+        }
+
+        // Add User Message
+        function addUserMessage(text) {
+            const { row, avatar } = createMessageRow('user');
+            
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.textContent = text;
+            
+            row.appendChild(bubble); // row-reverse makes this first
+            row.appendChild(avatar);
+            
+            chatArea.appendChild(row);
+            scrollToBottom();
+        }
+
+        // Streaming AI Message Handling
+        let currentAiContainer = null;
+        let currentAiSummary = null;
+        let currentAiDetail = null;
+        let currentFullText = "";
+
+        function startAiMessage() {
+            const { row, avatar } = createMessageRow('ai');
+            
+            const container = document.createElement('div');
+            container.className = 'bubble-container';
+            
+            row.appendChild(avatar);
+            row.appendChild(container);
+            
+            chatArea.appendChild(row);
+            
+            currentAiContainer = container;
+            currentAiSummary = null;
+            currentAiDetail = null;
+            currentFullText = "";
+            scrollToBottom();
+        }
+
+        function appendAiStream(chunk) {
+            if (!currentAiContainer) return;
+            
+            currentFullText += chunk;
+            
+            // Split by newline to separate summary and detail
+            const lines = currentFullText.split('\n');
+            const summaryText = lines[0];
+            const detailText = lines.slice(1).join('\n');
+            
+            // Update Summary
+            if (!currentAiSummary) {
+                currentAiSummary = document.createElement('div');
+                currentAiSummary.className = 'ai-summary-card';
+                
+                const icon = document.createElement('span');
+                icon.className = 'ai-summary-icon';
+                icon.textContent = '💡'; // Default icon
+                
+                const textSpan = document.createElement('span');
+                currentAiSummary.appendChild(icon);
+                currentAiSummary.appendChild(textSpan);
+                
+                currentAiContainer.appendChild(currentAiSummary);
+            }
+            currentAiSummary.querySelector('span:not(.ai-summary-icon)').textContent = summaryText;
+            
+            // Update Detail if exists
+            if (detailText.trim().length > 0) {
+                if (!currentAiDetail) {
+                    currentAiDetail = document.createElement('div');
+                    currentAiDetail.className = 'ai-detail-card';
+                    currentAiContainer.appendChild(currentAiDetail);
+                }
+                // Use marked.js to render Markdown
+                currentAiDetail.innerHTML = marked.parse(detailText);
+            }
+            
+            scrollToBottom();
+        }
+
+        function endAiMessage() {
+            currentAiContainer = null;
+            currentAiSummary = null;
+            currentAiDetail = null;
+            currentFullText = "";
+        }
+
+        function setStatus(text) {
+            const badge = document.querySelector('.status-badge');
+            if (badge) badge.textContent = text;
+        }
+
+        function setAssistantStatus(status) {
+            const icon = document.getElementById('assistantIcon');
+            if (!icon) return;
+            
+            if (status === 'awake') {
+                icon.textContent = '🤖'; // Awake
+                // Optional: Add some animation or color change
+            } else {
+                icon.textContent = '💤'; // Sleep
+            }
+        }
+
+        // Device Management
+        const micSelect = document.getElementById('micSelect');
+
+        function setDeviceList(devices) {
+            micSelect.innerHTML = ''; // Clear existing
+            
+            if (devices.length === 0) {
+                const option = document.createElement('option');
+                option.text = "未找到音频设备";
+                micSelect.add(option);
+                return;
+            }
+
+            devices.forEach(device => {
+                const option = document.createElement('option');
+                option.value = device;
+                option.text = device;
+                micSelect.add(option);
+            });
+        }
+
+        function setCurrentDevice(deviceName) {
+             micSelect.value = deviceName;
+        }
+
+        micSelect.onchange = function() {
+            if (backend && micSelect.value) {
+                backend.trigger_select_device(micSelect.value);
+            }
+        };
+
+        // Bind buttons
+        // Note: btn-update is in the header
+        document.querySelector('.btn-update').onclick = function() {
+            if (backend) {
+                backend.trigger_update_kb();
+            }
+        };
+
+    </script>
+</body>
+</html>

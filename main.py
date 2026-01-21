@@ -6,17 +6,162 @@ import datetime
 import json
 import threading
 import time
-
 import numpy as np
 import scipy.signal
 import scipy.io.wavfile
-from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QLabel, 
-                             QComboBox, QPushButton, QMessageBox, QTextEdit)
-from PyQt6.QtCore import QProcess, QThread, pyqtSignal
+from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QMessageBox, QHBoxLayout, QPushButton, QLabel, QSpacerItem, QSizePolicy)
+from PyQt6.QtCore import QProcess, QThread, pyqtSignal, QUrl, QObject, pyqtSlot, QFileInfo, Qt, QSize, QEvent
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+from PyQt6.QtWebChannel import QWebChannel
 import asr
 import llm
 import file_manager
-from langchain_core.tools import StructuredTool
+
+# 设置 QtWebEngine 禁用 GPU 加速，解决 0xC0000409 崩溃问题
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
+os.environ["QTWEBENGINE_REMOTE_DEBUGGING_PORT"] = "8333"
+
+class Backend(QObject):
+    update_kb_signal = pyqtSignal()
+    select_device_signal = pyqtSignal(str)
+
+    @pyqtSlot()
+    def trigger_update_kb(self):
+        print("Backend: Update KB triggered from JS")
+        self.update_kb_signal.emit()
+
+    @pyqtSlot(str)
+    def trigger_select_device(self, device_name):
+        print(f"Backend: Device selected from JS: {device_name}")
+        self.select_device_signal.emit(device_name)
+
+class CustomTitleBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent
+        self.setFixedHeight(32)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #1e293b;
+                color: #f1f5f9;
+            }
+            QLabel {
+                font-family: 'Segoe UI', sans-serif;
+                font-size: 13px;
+                padding-left: 10px;
+                font-weight: bold;
+            }
+            QPushButton {
+                border: none;
+                background-color: transparent;
+                color: #94a3b8;
+                font-size: 14px;
+                width: 32px;
+                height: 32px;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+                color: #ffffff;
+            }
+            QPushButton#btnClose:hover {
+                background-color: #ef4444;
+                color: white;
+            }
+            QPushButton#btnPin:checked {
+                color: #818cf8;
+                background-color: rgba(129, 140, 248, 0.1);
+            }
+        """)
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Title / Icon
+        self.title_label = QLabel("🤖 桌面语音问答助手")
+        layout.addWidget(self.title_label)
+        
+        layout.addSpacerItem(QSpacerItem(40, 20, QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum))
+
+        # Buttons
+        self.btn_pin = QPushButton("📌")
+        self.btn_pin.setObjectName("btnPin")
+        self.btn_pin.setToolTip("置顶 (Always on Top)")
+        self.btn_pin.setCheckable(True)
+        self.btn_pin.clicked.connect(self.toggle_on_top)
+        layout.addWidget(self.btn_pin)
+
+        self.btn_min = QPushButton("─")
+        self.btn_min.setToolTip("最小化")
+        self.btn_min.clicked.connect(self.minimize_window)
+        layout.addWidget(self.btn_min)
+
+        self.btn_max = QPushButton("☐")
+        self.btn_max.setToolTip("最大化")
+        self.btn_max.clicked.connect(self.toggle_maximize)
+        layout.addWidget(self.btn_max)
+
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setObjectName("btnClose")
+        self.btn_close.setToolTip("关闭")
+        self.btn_close.clicked.connect(self.close_window)
+        layout.addWidget(self.btn_close)
+
+        self.setLayout(layout)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self.parent_window:
+                self.parent_window.windowHandle().startSystemMove()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_maximize()
+
+    def toggle_on_top(self):
+        if not self.parent_window:
+            return
+        
+        flags = self.parent_window.windowFlags()
+        if self.btn_pin.isChecked():
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        else:
+            flags &= ~Qt.WindowType.WindowStaysOnTopHint
+        
+        self.parent_window.setWindowFlags(flags)
+        self.parent_window.show()
+
+    def minimize_window(self):
+        if self.parent_window:
+            self.parent_window.showMinimized()
+
+    def toggle_maximize(self):
+        if not self.parent_window:
+            return
+            
+        if self.parent_window.isMaximized():
+            self.parent_window.showNormal()
+            self.btn_max.setText("☐")
+            self.btn_max.setToolTip("最大化")
+        else:
+            self.parent_window.showMaximized()
+            self.btn_max.setText("❐")
+            self.btn_max.setToolTip("向下还原")
+
+    def update_maximize_btn(self, is_maximized):
+        if is_maximized:
+            self.btn_max.setText("❐")
+            self.btn_max.setToolTip("向下还原")
+        else:
+            self.btn_max.setText("☐")
+            self.btn_max.setToolTip("最大化")
+
+    def close_window(self):
+        if self.parent_window:
+            self.parent_window.close()
+
+
 
 class AudioListener(QThread):
     finished_recording = pyqtSignal(str)
@@ -144,24 +289,33 @@ class AudioListener(QThread):
         if self.process:
             self.process.terminate()
 
+
 class AudioRecorder(QWidget):
     update_chat_signal = pyqtSignal(str)
     update_status_signal = pyqtSignal(str)
+    update_awake_signal = pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
-        # 读取配置文件
-        self.config = self.load_config()
-        self.init_ui()
-        # 加载音频设备列表
-        self.load_devices()
-        
+
+        # 初始化成员变量
         self.listener = None
         self.is_awake = False
-        
+        self.current_device_name = None
+
+        # 读取配置文件
+        self.config = self.load_config()
+
+        # 初始化后端桥接
+        self.backend = Backend()
+        self.backend.update_kb_signal.connect(self.update_knowledge_base)
+        self.backend.select_device_signal.connect(self.change_device)
+
+        self.init_ui()
+
         # 初始化文件管理器
         self.file_manager = file_manager.FileManager(self.config)
-        
+
         # 初始化 大模型 助手
         llm_config = self.config.get('llm', {})
         self.ai_assistant = llm.chat(
@@ -171,14 +325,65 @@ class AudioRecorder(QWidget):
             model=llm_config.get('model'),
             file_manager_instance=self.file_manager
         )
-        
+
         # 绑定问答界面更新事件
-        self.update_chat_signal.connect(self.append_chat)
-        self.update_status_signal.connect(self.status_label.setText)
+        self.update_chat_signal.connect(self.handle_chat_update)
+        self.update_status_signal.connect(self.handle_status_update)
+        self.update_awake_signal.connect(self.handle_awake_update)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.Type.WindowStateChange:
+            if self.windowState() & Qt.WindowState.WindowMaximized:
+                self.layout().setContentsMargins(0, 0, 0, 0)
+                if hasattr(self, 'title_bar'):
+                    self.title_bar.update_maximize_btn(True)
+            else:
+                self.layout().setContentsMargins(5, 5, 5, 5)
+                if hasattr(self, 'title_bar'):
+                    self.title_bar.update_maximize_btn(False)
+        super().changeEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            margin = 5
+            rect = self.rect()
+            pos = event.position().toPoint()
+            edges = Qt.Edge(0)
+            
+            if pos.x() < margin: edges |= Qt.Edge.LeftEdge
+            if pos.x() > rect.width() - margin: edges |= Qt.Edge.RightEdge
+            if pos.y() < margin: edges |= Qt.Edge.TopEdge
+            if pos.y() > rect.height() - margin: edges |= Qt.Edge.BottomEdge
+            
+            if edges != Qt.Edge(0):
+                if self.windowHandle().startSystemResize(edges):
+                    return
+                    
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        margin = 5
+        rect = self.rect()
+        pos = event.position().toPoint()
         
-        # 如果设备可用，自动开始监听
-        if self.device_combo.count() > 0:
-            self.start_listening()
+        on_left = pos.x() < margin
+        on_right = pos.x() > rect.width() - margin
+        on_top = pos.y() < margin
+        on_bottom = pos.y() > rect.height() - margin
+        
+        if on_left and on_top: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif on_right and on_bottom: self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif on_left and on_bottom: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif on_right and on_top: self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif on_left or on_right: self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif on_top or on_bottom: self.setCursor(Qt.CursorShape.SizeVerCursor)
+        else: self.setCursor(Qt.CursorShape.ArrowCursor)
+        
+        super().mouseMoveEvent(event)
+        
+    def mouseReleaseEvent(self, event):
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().mouseReleaseEvent(event)
 
     def load_config(self):
         config_path = os.path.join(os.getcwd(), 'config.json')
@@ -191,65 +396,137 @@ class AudioRecorder(QWidget):
 
     def init_ui(self):
         self.setWindowTitle('桌面语音问答助手')
-        self.setGeometry(100, 100, 700, 700)
-
-        # 调整全局字体大小（增大 5 个字号）
-        font = self.font()
-        base_size = font.pointSize()
-        if base_size <= 0:
-            base_size = 9  # 默认基准
-        font.setPointSize(base_size + 3)
-        self.setFont(font)
+        self.setGeometry(100, 100, 800, 800) # Slightly larger for web view
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setStyleSheet("background-color: #1e293b;")
+        self.setMouseTracking(True)
 
         layout = QVBoxLayout()
+        layout.setContentsMargins(5, 5, 5, 5) # Minimize margins for full web view look
+        layout.setSpacing(0)
 
-        self.label = QLabel("选择麦克风设备:")
-        layout.addWidget(self.label)
+        # Custom Title Bar
+        self.title_bar = CustomTitleBar(self)
+        layout.addWidget(self.title_bar)
 
-        self.device_combo = QComboBox()
-        layout.addWidget(self.device_combo)
-
-        self.restart_btn = QPushButton("重新启动监听")
-        self.restart_btn.clicked.connect(self.start_listening)
-        layout.addWidget(self.restart_btn)
-
-        self.update_kb_btn = QPushButton("更新文件知识库")
-        self.update_kb_btn.clicked.connect(self.update_knowledge_base)
-        layout.addWidget(self.update_kb_btn)
-
-        self.status_label = QLabel("正在初始化...")
-        layout.addWidget(self.status_label)
+        # Web Engine View
+        self.web_view = QWebEngineView()
         
-        self.chat_display = QTextEdit()
-        self.chat_display.setReadOnly(True)
-        layout.addWidget(self.chat_display)
+        # Setup WebChannel
+        self.channel = QWebChannel()
+        self.channel.registerObject('backend', self.backend)
+        self.web_view.page().setWebChannel(self.channel)
+
+        # Load HTML
+        html_path = os.path.abspath("ui_prototype.html")
+        self.web_view.loadFinished.connect(self.on_load_finished)
+        self.web_view.setUrl(QUrl.fromLocalFile(html_path))
+
+        layout.addWidget(self.web_view)
 
         self.setLayout(layout)
 
-        
+        self.is_web_loaded = False
+
+    def on_load_finished(self, ok):
+        if ok:
+            print("Web page loaded successfully.")
+            self.is_web_loaded = True
+
+            # Populate devices in HTML
+            devices = self.get_audio_devices()
+            js_code = f"setDeviceList({json.dumps(devices)});"
+            self.web_view.page().runJavaScript(js_code)
+
+            # Start listening on first device if available
+            if devices:
+                default_device = devices[0]
+                self.start_listening(default_device)
+                # Sync UI
+                self.web_view.page().runJavaScript(f"setCurrentDevice('{default_device}');")
+            else:
+                self.handle_status_update("未找到音频设备")
+        else:
+            print("Failed to load web page.")
+
+    def change_device(self, device_name):
+        print(f"Switching device to: {device_name}")
+        self.start_listening(device_name)
+
+    def handle_status_update(self, text):
+        if not hasattr(self, 'is_web_loaded') or not self.is_web_loaded:
+            print(f"Web not loaded yet, skipping status: {text}")
+            return
+
+        # Call JS setStatus
+        js_code = f"setStatus('{text}');"
+        self.web_view.page().runJavaScript(js_code)
+
+    def handle_awake_update(self, is_awake):
+        if not hasattr(self, 'is_web_loaded') or not self.is_web_loaded:
+            return
+
+        status = 'awake' if is_awake else 'sleep'
+        js_code = f"setAssistantStatus('{status}');"
+        self.web_view.page().runJavaScript(js_code)
+
+    def handle_chat_update(self, text):
+        if not hasattr(self, 'is_web_loaded') or not self.is_web_loaded:
+            return
+
+        # Dispatch to appropriate JS function
+        if text.startswith("[STREAM]"):
+            chunk = text[8:].replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n').replace('\r', '')
+            self.web_view.page().runJavaScript(f"appendAiStream('{chunk}');")
+        elif text.startswith("提问: "):
+            content = text[4:].replace('\\', '\\\\').replace("'", "\\'")
+            self.web_view.page().runJavaScript(f"addUserMessage('{content}');")
+        elif text.startswith("用户: "):
+            content = text[4:].replace('\\', '\\\\').replace("'", "\\'")
+            self.web_view.page().runJavaScript(f"addUserMessage('{content}');")
+        elif text == "回答: ":
+            self.web_view.page().runJavaScript("startAiMessage();")
+        elif text == "\n":
+            self.web_view.page().runJavaScript("endAiMessage();")
+        elif text.startswith("系统消息: "):
+            content = text[6:].replace('\\', '\\\\').replace("'", "\\'")
+            # Treat system messages as status or special user messages? 
+            # For now, let's just log or set status, or maybe show as a user message for visibility?
+            # User wanted "Update KB" to show status.
+            self.handle_status_update(content)
+        elif text.startswith("Error: "):
+            self.handle_status_update(text)
+
     def update_knowledge_base(self):
-        self.status_label.setText("正在更新知识库...")
+        self.update_status_signal.emit("正在更新知识库...")
         threading.Thread(target=self._run_manual_update).start()
 
     def _run_manual_update(self):
-        self.file_manager.index_files()
-        print("Manual update triggered.")
-        self.update_status_signal.emit("知识库更新完毕")
-        
+        try:
+            if not hasattr(self, 'file_manager'):
+                self.file_manager = file_manager.FileManager(self.config)
+
+            self.file_manager.initialize_elasticsearch()
+            # 指定要更新的目录，这里假设是配置文件中的第一个目录，或者默认目录
+            target_dirs = self.config.get('monitor_paths', [])
+            if not target_dirs:
+                # Fallback to desktop if not configured
+                target_dirs = [os.path.join(os.path.expanduser("~"), "Desktop")]
+
+            print(f"Updating KB for: {target_dirs}")
+            self.file_manager.index_files(target_dirs)
+            self.update_status_signal.emit("知识库更新完成")
+        except Exception as e:
+            print(f"Update failed: {e}")
+            self.update_status_signal.emit(f"更新失败: {e}")
+
         # 恢复监听状态显示
         time.sleep(1)
         if self.listener and self.listener.is_running:
-            device_name = self.device_combo.currentText()
-            self.update_status_signal.emit(f"正在监听: {device_name}")
+            if self.current_device_name:
+                self.update_status_signal.emit(f"正在监听: {self.current_device_name}")
         else:
             self.update_status_signal.emit("就绪")
-
-    def load_devices(self):
-        devices = self.get_audio_devices()
-        if not devices:
-            self.device_combo.addItem("未找到音频设备")
-        else:
-            self.device_combo.addItems(devices)
 
     def get_audio_devices(self):
         devices = []
@@ -289,31 +566,33 @@ class AudioRecorder(QWidget):
             print(f"Error getting devices: {e}")
         return devices
 
-    def start_listening(self):
+    def start_listening(self, device_name=None):
         if self.listener:
             self.listener.stop()
             self.listener.wait()
-            
-        device_name = self.device_combo.currentText()
+
+        if device_name is None:
+            if self.current_device_name:
+                device_name = self.current_device_name
+            else:
+                # Should not happen ideally if initialized correctly
+                self.handle_status_update("请先选择音频设备")
+                return
+
+        self.current_device_name = device_name
+
         if not device_name or device_name == "未找到音频设备":
-            self.status_label.setText("无效的音频设备")
+            self.handle_status_update("无效的音频设备")
             return
-            
-        self.status_label.setText(f"正在监听: {device_name}")
+
+        self.handle_status_update(f"正在监听: {device_name}")
         self.listener = AudioListener(device_name)
-        # 绑定录制完毕后的事件
         self.listener.finished_recording.connect(self.on_recording_finished)
         self.listener.start()
 
     def on_recording_finished(self, filepath):
-        self.status_label.setText("正在识别...")
+        self.handle_status_update("正在识别...")
         threading.Thread(target=self.process_audio, args=(filepath,)).start()
-
-    def append_chat(self, text):
-        self.chat_display.append(text)
-        # 自动滚动
-        sb = self.chat_display.verticalScrollBar()
-        sb.setValue(sb.maximum())
 
     def process_audio(self, audio_path):
         print(f"Starting recognition for {audio_path}")
@@ -330,14 +609,14 @@ class AudioRecorder(QWidget):
         try:
             text = asr.recognize_with_xfyun(audio_path, appid, apikey, appsecret)
             print(f"识别结果: {text}")
-            
+
             # 在识别后立即删除音频
             self.delete_audio(audio_path)
-            
+
             if not text:
                 return
 
-            self.status_label.setText("监听中...")
+            self.update_status_signal.emit("监听中...")
 
             # 处理结果
             keyTextConfig = self.config.get("keyText", {})
@@ -346,12 +625,14 @@ class AudioRecorder(QWidget):
 
             if awake_word and awake_word in text:
                 self.is_awake = True
+                self.update_awake_signal.emit(True)
                 self.play_audio(os.path.join(os.getcwd(), 'records', 'here.mp3'))
                 self.update_chat_signal.emit(f"用户: {text}")
                 self.update_chat_signal.emit(f"系统消息: 唤醒成功\n")
                 return
             elif sleep_word and sleep_word in text:
                 self.is_awake = False
+                self.update_awake_signal.emit(False)
                 self.play_audio(os.path.join(os.getcwd(), 'records', 'exit.mp3'))
                 self.update_chat_signal.emit(f"用户: {text}")
                 self.update_chat_signal.emit(f"系统消息: 进入休眠")
@@ -360,22 +641,22 @@ class AudioRecorder(QWidget):
             # 大模型 交互
             if self.is_awake:
                 self.update_chat_signal.emit(f"提问: {text}")
-                
+
                 try:
-                    self.update_chat_signal.emit("回答: ") # 新行起始
-                    
+                    self.update_chat_signal.emit("回答: ")  # 新行起始
+
                     # 使用 self.ai_assistant 进行流式对话，session_id 固定为 "user_main_session"
                     generator = self.ai_assistant.ask_stream(text, session_id="user_main_session")
-                    
+
                     for chunk in generator:
-                        self.update_chat_signal.emit(f"[STREAM]{chunk}") # 流式传输的特殊前缀
-                    
-                    self.update_chat_signal.emit("\n") # 消息结束
-                    
+                        self.update_chat_signal.emit(f"[STREAM]{chunk}")  # 流式传输的特殊前缀
+
+                    self.update_chat_signal.emit("\n")  # 消息结束
+
                 except Exception as e:
                     print(f"\n小助手发生错误: {e}")
                     self.update_chat_signal.emit(f"Error: {e}")
-                
+
         except Exception as e:
             print(f"Recognition error: {e}")
             self.delete_audio(audio_path)
@@ -392,22 +673,11 @@ class AudioRecorder(QWidget):
         if not os.path.exists(file_path):
             return
         try:
-            subprocess.run(['ffplay', '-nodisp', '-autoexit', '-hide_banner', file_path], 
+            subprocess.run(['ffplay', '-nodisp', '-autoexit', '-hide_banner', file_path],
                            check=True)
         except Exception as e:
             print(f"Error playing audio: {e}")
-            
-    # 修改 append_chat 以处理流式传输
-    def append_chat(self, text):
-        if text.startswith("[STREAM]"):
-            chunk = text[8:]
-            self.chat_display.moveCursor(self.chat_display.textCursor().MoveOperation.End)
-            self.chat_display.insertPlainText(chunk)
-        else:
-            self.chat_display.append(text)
-        
-        sb = self.chat_display.verticalScrollBar()
-        sb.setValue(sb.maximum())
+
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

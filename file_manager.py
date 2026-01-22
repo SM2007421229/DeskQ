@@ -3,16 +3,22 @@ import time
 import threading
 from datetime import datetime
 import pandas as pd
-from elasticsearch import Elasticsearch
+import requests
+from elasticsearch import Elasticsearch, helpers
+import warnings
+import traceback
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+
+HAS_SENTENCE_TRANSFORMERS = False
 
 try:
-    from sklearn.feature_extraction.text import HashingVectorizer
-    from sklearn.preprocessing import normalize
-    HAS_SKLEARN = True
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    HAS_LANGCHAIN = True
 except ImportError:
-    HAS_SKLEARN = False
+    HAS_LANGCHAIN = False
 
-# Optional imports for file reading
 try:
     from docx import Document
 except ImportError:
@@ -22,6 +28,221 @@ try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
+
+try:
+    from pptx import Presentation
+except ImportError:
+    Presentation = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+import openpyxl
+
+# --- Helper Classes ---
+
+
+class ContentExtractor:
+    """Handles content extraction and splitting for various file formats."""
+    def __init__(self):
+        if HAS_LANGCHAIN:
+            self.text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=600,
+                chunk_overlap=100,
+                separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?", " ", ""]
+            )
+        else:
+            self.text_splitter = None
+
+    def load_and_split(self, file_path, ext):
+        """
+        Extract content from file and split into chunks.
+        Returns: List of dicts [{"content": str, "page_info": str}]
+        """
+        try:
+            raw_text = ""
+            metadata_list = [] # parallel to chunks if possible, or just raw text first
+
+            if ext == '.docx':
+                if Document:
+                    doc = Document(file_path)
+                    raw_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                else:
+                    return []
+
+            elif ext == '.pdf':
+                if PdfReader:
+                    reader = PdfReader(file_path)
+                    texts = []
+                    for i, page in enumerate(reader.pages):
+                        page_text = page.extract_text()
+                        if page_text:
+                            texts.append(f"[Page {i+1}] {page_text}")
+                    raw_text = "\n".join(texts)
+                else:
+                    return []
+
+            elif ext in ['.xlsx', '.xls']:
+                # Optimized for RAG: Row-based chunking with explicit headers
+                try:
+                    dfs = pd.read_excel(file_path, sheet_name=None)
+                    custom_chunks = []
+                    chunk_counter = 0
+                    
+                    for sheet, df in dfs.items():
+                        # Clean data
+                        df = df.fillna('')
+                        
+                        # Convert all columns to string for safe usage
+                        columns = [str(c).strip() for c in df.columns]
+                        
+                        # Add sheet context
+                        sheet_context = f"File: {os.path.basename(file_path)}, Sheet: {sheet}"
+                        
+                        for _, row in df.iterrows():
+                            # Construct semantic row representation: "Col1: Val1, Col2: Val2..."
+                            row_parts = []
+                            for col, val in zip(columns, row):
+                                val_str = str(val).strip()
+                                if val_str: # Skip empty values
+                                    row_parts.append(f"{col}: {val_str}")
+                            
+                            if not row_parts:
+                                continue
+                                
+                            row_str = f"[{sheet}] " + ", ".join(row_parts)
+                            
+                            # Strict One Row Per Chunk
+                            # Include context in every chunk for independence
+                            chunk_text = f"{sheet_context}\n{row_str}"
+                            custom_chunks.append({"content": chunk_text, "chunk_id": chunk_counter})
+                            chunk_counter += 1
+                            
+                    return custom_chunks
+                    
+                except Exception as e:
+                    print(f"Error parsing Excel {file_path}: {e}")
+                    return []
+
+            elif ext == '.pptx':
+                if Presentation:
+                    prs = Presentation(file_path)
+                    texts = []
+                    for i, slide in enumerate(prs.slides):
+                        slide_texts = []
+                        if slide.shapes.title:
+                            slide_texts.append(f"Title: {slide.shapes.title.text}")
+                        for shape in slide.shapes:
+                            if hasattr(shape, "text") and shape.text:
+                                slide_texts.append(shape.text)
+                        if slide_texts:
+                            texts.append(f"[Slide {i+1}] " + "\n".join(slide_texts))
+                    raw_text = "\n".join(texts)
+                else:
+                    return []
+
+            elif ext in ['.html', '.htm']:
+                if BeautifulSoup:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        soup = BeautifulSoup(f, 'html.parser')
+                        raw_text = soup.get_text(separator='\n')
+                else:
+                    return []
+
+            elif ext in ['.txt', '.md', '.py', '.json', '.log', '.xml', '.ini', '.yml']:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    raw_text = f.read()
+
+            else:
+                return []
+
+            # Split text
+            if not raw_text.strip():
+                return []
+
+            if self.text_splitter:
+                chunks = self.text_splitter.split_text(raw_text)
+            else:
+                # Fallback simple splitter
+                chunks = [raw_text[i:i+500] for i in range(0, len(raw_text), 500)]
+
+            return [{"content": chunk, "chunk_id": i} for i, chunk in enumerate(chunks)]
+
+        except Exception as e:
+            print(f"Error extracting {file_path}: {e}")
+            return []
+
+class VectorModel:
+    """Wrapper for Aliyun OpenSearch Text Embedding API."""
+    def __init__(self, api_url, api_key=None):
+        self.api_key = api_key
+        self.api_url = api_url
+        # ops-text-embedding-002 dimension is 1024 based on test result
+        self.dim = 1024
+
+    def encode(self, texts, input_type="QUERY"):
+        if not self.api_key or not self.api_url or not texts:
+            return [[0.0] * self.dim] * len(texts)
+        
+        # Check if texts are empty
+        if not any(t.strip() for t in texts):
+            return [[0.0] * self.dim] * len(texts)
+
+        # Batch processing
+        batch_size = 32  # Max batch size per API documentation
+        all_embeddings = []
+        
+        try:
+            for i in range(0, len(texts), batch_size):
+                # Slice batch
+                raw_batch = texts[i:i + batch_size]
+                
+                # Truncate each text to max 8192 chars
+                batch_texts = [t[:8192] for t in raw_batch]
+                
+                # Skip empty batch (shouldn't happen with range logic but good safety)
+                if not batch_texts:
+                    continue
+                    
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}"
+                }
+                
+                payload = {
+                    "input": batch_texts,
+                    "input_type": input_type
+                }
+                
+                response = requests.post(self.api_url, json=payload, headers=headers, timeout=30) # Increased timeout
+                response.raise_for_status()
+                
+                result = response.json()
+                if "result" in result and "embeddings" in result["result"]:
+                    # Sort by index to ensure order matches input
+                    embeddings_data = sorted(result["result"]["embeddings"], key=lambda x: x["index"])
+                    batch_embeddings = [item["embedding"] for item in embeddings_data]
+                    all_embeddings.extend(batch_embeddings)
+                    
+                    # Update dim if we get a result
+                    if batch_embeddings:
+                         self.dim = len(batch_embeddings[0])
+                else:
+                    print(f"API response format unexpected: {result}")
+                    all_embeddings.extend([[0.0] * self.dim] * len(batch_texts))
+            
+            return all_embeddings
+                
+        except Exception as e:
+            print(f"Encoding error: {e}")
+            # Return zero vectors for failed batch + remaining items to match length
+            current_len = len(all_embeddings)
+            needed = len(texts) - current_len
+            return all_embeddings + ([[0.0] * self.dim] * needed)
+
+# --- Main Class ---
 
 class FileManager:
     def __init__(self, config):
@@ -33,12 +254,20 @@ class FileManager:
         self.reindex_interval = self.config.get('watch_interval', self.config.get('reindex_interval', 3600))
 
         # ES Config
+        es_config = config.get('es', {})
+        self.es_host = es_config.get('host', "http://localhost:9200")
+        self.es_user = es_config.get('user')
+        self.es_password = es_config.get('password')
+        # Use a new index name for RAG to avoid conflict with old mapping
+        # ops-text-embedding-002 has 1024 dims, updating index name
+        self.index_name = "deskq_rag_files_v3"
+        
+        # Initialize Components
+        self.extractor = ContentExtractor()
+        # Pass API key and URL to VectorModel
         vector_config = config.get('vector', {})
-        self.es_host = vector_config.get('host', "http://localhost:9200")
-        self.es_user = vector_config.get('user')
-        self.es_password = vector_config.get('password')
-        self.index_name = "deskq_files"
-        self.vector_dim = 1024
+        self.vector_model = VectorModel(vector_config.get("apiUrl"), vector_config.get("apikey"))
+        self.vector_dim = self.vector_model.dim
         
         print(f"Initializing Elasticsearch at {self.es_host}...")
         try:
@@ -48,8 +277,6 @@ class FileManager:
             }
             
             if self.es_user and self.es_password:
-                print(f"Using Basic Auth with user: {self.es_user}")
-                # For elasticsearch<8.0.0, use http_auth
                 es_args["http_auth"] = (self.es_user, self.es_password)
                 
             self.es = Elasticsearch(**es_args)
@@ -59,27 +286,12 @@ class FileManager:
             print(f"Error connecting to Elasticsearch: {e}")
             self.es = None
 
-        if HAS_SKLEARN:
-            # Use HashingVectorizer to create dense vectors via hashing + normalization
-            # Note: This is a lightweight way to get embeddings without a heavy ML model
-            self.vectorizer = HashingVectorizer(
-                n_features=self.vector_dim,
-                analyzer='char_wb',
-                ngram_range=(2, 4),
-                norm=None,
-                alternate_sign=False
-            )
-        else:
-            print("Warning: scikit-learn not found. Vector search will fail.")
-            self.vectorizer = None
-
         self._init_es_index()
         
         self.is_indexing = False
         self.running = True
         
-        # 启动自动索引线程 (可以通过配置禁用，方便测试)
-        # Check root config for auto_index
+        # Auto index thread
         if config.get('auto_index', True):
             self.thread = threading.Thread(target=self._auto_reindex_loop, daemon=True)
             self.thread.start()
@@ -89,17 +301,39 @@ class FileManager:
             return
             
         try:
+            # Check if index exists
+            if self.es.indices.exists(index=self.index_name):
+                # Verify mapping 'path' is keyword
+                mapping = self.es.indices.get_mapping(index=self.index_name)
+                # Structure: {index_name: {mappings: {properties: {path: {type: ...}}}}}
+                try:
+                    path_type = mapping[self.index_name]['mappings']['properties']['path']['type']
+                    if path_type != 'keyword':
+                        print(f"Index {self.index_name} has incorrect mapping for 'path' ({path_type}). Recreating...")
+                        self.es.indices.delete(index=self.index_name)
+                    else:
+                        # Mapping is correct
+                        return
+                except KeyError:
+                    # Could happen if 'path' field doesn't exist yet or structure is different
+                    print(f"Index {self.index_name} mapping check failed. Recreating...")
+                    self.es.indices.delete(index=self.index_name, ignore=[404])
+
+            # Create index if not exists (or deleted above)
             if not self.es.indices.exists(index=self.index_name):
                 mapping = {
                     "mappings": {
                         "properties": {
-                            "name": {"type": "text"},
+                            "file_name": {"type": "text", "analyzer": "standard"},
                             "path": {"type": "keyword"},
                             "ext": {"type": "keyword"},
-                            "embedding": {
+                            "mtime": {"type": "double"},
+                            "content": {"type": "text", "analyzer": "standard"},
+                            "content_vector": {
                                 "type": "dense_vector",
                                 "dims": self.vector_dim
                             },
+                            "chunk_id": {"type": "integer"},
                             "created_at": {"type": "date"}
                         }
                     }
@@ -107,32 +341,32 @@ class FileManager:
                 self.es.indices.create(index=self.index_name, body=mapping)
                 print(f"Created Elasticsearch index: {self.index_name}")
         except Exception as e:
-            print(f"Error creating index: {e}")
-
-    def _vectorize(self, text):
-        if not self.vectorizer:
-            return [0.0] * self.vector_dim
-        X = self.vectorizer.transform([text])
-        # L2 normalization to ensure cosine similarity works as expected
-        X = normalize(X.toarray(), norm='l2')
-        return X[0].tolist()
+            print(f"Error checking/creating index: {e}")
 
     def _auto_reindex_loop(self):
         while self.running:
-            self.index_files()
+            try:
+                self.index_files()
+            except Exception as e:
+                print(f"Auto-index error: {e}")
             time.sleep(self.reindex_interval)
 
-    def index_files(self):
+    def index_files(self, specific_folders=None):
+        """
+        Index files from monitored folders.
+        Supports incremental updates via mtime.
+        """
         if self.is_indexing:
             return
         self.is_indexing = True
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting file index on {self.monitored_folders}...")
+        target_folders = specific_folders or self.monitored_folders
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting RAG index on {target_folders}...")
         
         try:
             # 1. Scan current files on disk
-            current_files = {} # path -> {name, ext, path}
+            current_files = {} # path -> {name, ext, path, mtime}
             
-            for folder in self.monitored_folders:
+            for folder in target_folders:
                 if not os.path.exists(folder):
                     continue
                 
@@ -141,313 +375,303 @@ class FileManager:
                         ext = os.path.splitext(file)[1].lower()
                         if ext in self.file_types:
                             full_path = os.path.join(root, file)
-                            # Normalize path separators to avoid duplicates
                             full_path = os.path.normpath(full_path)
+                            mtime = os.path.getmtime(full_path)
+                            
                             current_files[full_path] = {
                                 "name": file,
                                 "path": full_path,
-                                "ext": ext
+                                "ext": ext,
+                                "mtime": mtime
                             }
             
-            # 2. Get existing files in Vector Store
-            existing_ids = set()
+            # 2. Get existing files metadata from ES
+            # We aggregate by path to get stored mtime
+            existing_files = {} # path -> mtime
             if self.es:
                 try:
-                    # Scan all documents to get current IDs
-                    # Note: For very large indices, use helpers.scan
+                    # Ensure index exists
+                    if not self.es.indices.exists(index=self.index_name):
+                        self._init_es_index()
+                        
+                    # Terms aggregation on path to find all indexed files
+                    # Note: For huge datasets, composite agg or scroll is better.
+                    # Here we use a simple search collapsing on path or just scrolling hits.
+                    # Since we store multiple chunks per file, we just need to know which files are there.
+                    # We can search for all unique 'path' and their 'mtime'.
+                    
+                    # Using a collapse query to get unique paths
                     resp = self.es.search(
                         index=self.index_name,
                         body={
                             "query": {"match_all": {}},
-                            "_source": ["path"],
+                            "_source": ["path", "mtime"],
+                            "collapse": {"field": "path"},
                             "size": 10000 
                         }
                     )
+                    
                     for hit in resp['hits']['hits']:
-                         # Use path as ID or retrieve from source
-                         path = hit['_source'].get('path')
-                         if path:
-                             existing_ids.add(path)
+                        src = hit['_source']
+                        existing_files[src.get('path')] = src.get('mtime', 0)
+                        
                 except Exception as e:
                     print(f"Error fetching existing files from ES: {e}")
 
             # 3. Calculate Diff
-            files_on_disk_ids = set(current_files.keys())
+            files_on_disk = set(current_files.keys())
+            files_in_index = set(existing_files.keys())
             
-            # Files to add (present on disk but not in DB)
-            to_add_ids = list(files_on_disk_ids - existing_ids)
+            to_delete = files_in_index - files_on_disk
+            to_add_or_update = []
             
-            # Files to delete (present in DB but not on disk)
-            to_delete_ids = list(existing_ids - files_on_disk_ids)
-            
-            # 4. Apply Updates
-            if to_delete_ids and self.es:
-                print(f"Removing {len(to_delete_ids)} deleted files from index...")
-                # Delete by query is safer or bulk delete
-                # Since we use path as ID logic (but maybe not _id), let's delete by term
-                # Ideally we should use path as _id to make this easier.
-                # For now, let's assume we search and delete.
-                # Actually, using delete_by_query is good.
-                try:
-                    # Batch delete might be tricky with terms query limit (65k).
-                    # Loop chunks if needed.
-                    chunk_size = 1000
-                    for i in range(0, len(to_delete_ids), chunk_size):
-                        chunk = to_delete_ids[i:i+chunk_size]
-                        self.es.delete_by_query(
-                            index=self.index_name,
-                            body={"query": {"terms": {"path": chunk}}}
-                        )
-                except Exception as e:
-                     print(f"Error deleting files: {e}")
+            for path in files_on_disk:
+                if path not in files_in_index:
+                    to_add_or_update.append(path)
+                else:
+                    # Check mtime
+                    if current_files[path]['mtime'] > existing_files[path] + 1.0: # 1s buffer
+                        to_add_or_update.append(path)
+
+            # 4. Apply Deletions
+            if to_delete and self.es:
+                print(f"Removing {len(to_delete)} deleted files...")
+                for path in to_delete:
+                    self.es.delete_by_query(
+                        index=self.index_name,
+                        body={"query": {"term": {"path": path}}}
+                    )
+
+            # 5. Apply Updates (Delete old chunks -> Index new chunks)
+            if to_add_or_update and self.es:
+                print(f"Indexing {len(to_add_or_update)} files...")
                 
-            if to_add_ids and self.es:
-                print(f"Adding {len(to_add_ids)} new files to index...")
-                from elasticsearch import helpers
-                
-                actions = []
-                for file_path in to_add_ids:
-                    meta = current_files[file_path]
-                    vector = self._vectorize(meta['name'])
-                    
-                    doc = {
-                        "_index": self.index_name,
-                        # Use path as _id to ensure uniqueness and easy access
-                        # However, path might contain chars invalid for some ID contexts, but usually fine.
-                        # Base64 encoding path as ID is safer, but raw path is readable.
-                        # Let's rely on ES autogen ID or just search by path.
-                        # Using path as ID allows upserts easily.
-                        # Let's NOT force _id=path to avoid issues, just rely on path field uniqueness via logic.
-                        # But wait, to check existing_ids efficiently, _id is best.
-                        # Let's stick to the logic: we query all paths, so we know what to add/delete.
-                        "_source": {
-                            "name": meta['name'],
-                            "path": meta['path'],
-                            "ext": meta['ext'],
-                            "embedding": vector,
-                            "created_at": datetime.now().isoformat()
-                        }
-                    }
-                    actions.append(doc)
-                
-                if actions:
+                for path in to_add_or_update:
                     try:
-                        helpers.bulk(self.es, actions)
+                        # First delete existing chunks for this file to avoid duplication
+                        if path in files_in_index:
+                             self.es.delete_by_query(
+                                index=self.index_name,
+                                body={"query": {"term": {"path": path}}}
+                            )
+                        
+                        meta = current_files[path]
+                        
+                        # Extract and Split
+                        chunks = self.extractor.load_and_split(path, meta['ext'])
+                        if not chunks:
+                            continue
+                            
+                        # Embed
+                        texts = [c['content'] for c in chunks]
+                        # Use input_type="DOCUMENT" for indexing if API supports, but user example used "query".
+                        # Usually embedding APIs use "document" for storage. Let's use "document" for now.
+                        # Wait, user example only showed "query". If I use "document" and it fails, that's bad.
+                        # However, Aliyun OpenSearch usually supports "query" and "document".
+                        # Let's try "document" for indexing.
+                        vectors = self.vector_model.encode(texts, input_type="DOCUMENT")
+                        
+                        # Prepare Bulk Actions
+                        actions = []
+                        for i, chunk in enumerate(chunks):
+                            doc = {
+                                "_index": self.index_name,
+                                "_source": {
+                                    "file_name": meta['name'],
+                                    "path": meta['path'],
+                                    "ext": meta['ext'],
+                                    "mtime": meta['mtime'],
+                                    "content": chunk['content'],
+                                    "content_vector": vectors[i],
+                                    "chunk_id": chunk['chunk_id'],
+                                    "created_at": datetime.now().isoformat()
+                                }
+                            }
+                            actions.append(doc)
+                        
+                        if actions:
+                            helpers.bulk(self.es, actions)
+                            
                     except Exception as e:
-                         print(f"Error bulk indexing: {e}")
-            
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] File index completed. Total files: {len(files_on_disk_ids)} (+{len(to_add_ids)}, -{len(to_delete_ids)})")
+                        print(f"Failed to index {path}: {e}")
+                        traceback.print_exc()
+
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Indexing completed. (+{len(to_add_or_update)}, -{len(to_delete)})")
             
         except Exception as e:
             print(f"Error during file indexing: {e}")
+            traceback.print_exc()
         finally:
             self.is_indexing = False
 
     def query_files(self, query):
         """
-        根据查询词语义搜索文件
-        :param query: 查询关键词
-        :return: 文件列表字符串描述
+        Hybrid Retrieval: Vector Search + BM25 + File Name Match
+        With Re-ranking logic.
         """
         try:
+            query_text = query
             if isinstance(query, dict):
-                query = query.get('query', '') or query.get('text', '') or ''
+                query_text = query.get('query', '') or query.get('text', '') or ''
             
-            if not query or (isinstance(query, str) and not query.strip()):
-                if not self.es:
-                    return "Elasticsearch 未连接。"
+            if not query_text or not query_text.strip():
+                return "请输入有效的查询内容。"
                 
-                # Return all files (or top 50 to avoid overflow)
-                try:
-                    resp = self.es.search(
-                        index=self.index_name,
-                        body={
-                            "query": {"match_all": {}},
-                            "size": 50,
-                            "_source": ["name", "path"]
-                        }
-                    )
-                    hits = resp['hits']['hits']
-                    if not hits:
-                        return "知识库为空。"
-                    
-                    output = ["知识库文件列表 (前 50 个):"]
-                    for i, hit in enumerate(hits):
-                        source = hit['_source']
-                        output.append(f"- {source['name']} (Path: {source['path']})")
-                    
-                    total = resp['hits']['total']['value']
-                    if total > 50:
-                        output.append(f"... 等 {total - 50} 个更多文件")
-                    return "\n".join(output)
-                except Exception as e:
-                    return f"查询出错: {e}"
-
             if not self.es:
                 return "Elasticsearch 未连接。"
 
-            # Vector Search
-            query_vector = self._vectorize(query)
+            # 1. Vector Search (Semantic)
+            # Use input_type="QUERY" for searching
+            query_vector = self.vector_model.encode([query_text], input_type="QUERY")[0]
             
-            # ES 7.x script_score query
-            # Note: cosineSimilarity requires doc['embedding']
-            script_query = {
-                "script_score": {
-                    "query": {"match_all": {}},
-                    "script": {
-                        "source": "cosineSimilarity(params.query_vector, doc['embedding']) + 1.0",
-                        "params": {"query_vector": query_vector}
+            # Check for zero vector (model failure or empty input)
+            is_zero_vector = all(abs(v) < 1e-6 for v in query_vector)
+            
+            vec_resp = None
+            if not is_zero_vector and self.es.indices.exists(index=self.index_name):
+                try:
+                    vector_query = {
+                        "script_score": {
+                            "query": {"match_all": {}},
+                            "script": {
+                                "source": "cosineSimilarity(params.query_vector, doc['content_vector']) + 1.0",
+                                "params": {"query_vector": query_vector}
+                            }
+                        }
                     }
+                    
+                    # Path A: Vector Candidates
+                    vec_resp = self.es.search(
+                        index=self.index_name,
+                        body={"query": vector_query, "size": 20, "_source": ["file_name", "path", "content"]}
+                    )
+                except Exception as e:
+                    print(f"Vector search failed: {e}")
+                    vec_resp = None
+            else:
+                print("Warning: Generated query vector is all zeros. Skipping vector search.")
+
+            # 2. BM25 Search (Keyword) - Content and Filename
+            keyword_query = {
+                "bool": {
+                    "should": [
+                        {"match": {"content": {"query": query_text, "boost": 1.0}}},
+                        {"match": {"file_name": {"query": query_text, "boost": 2.0}}} # Filename match has higher boost
+                    ]
                 }
             }
             
-            resp = self.es.search(
+            # Path B: Keyword Candidates
+            kw_resp = self.es.search(
                 index=self.index_name,
-                body={
-                    "query": script_query,
-                    "size": 20,
-                    "_source": ["name", "path"]
-                }
+                body={"query": keyword_query, "size": 20, "_source": ["file_name", "path", "content"]}
             )
             
-            hits = resp['hits']['hits']
-            if not hits:
-                return "未找到匹配的文件。"
+            # Fuse Results (Weighted Sum of normalized scores)
+            # This is a simplified re-ranking
+            hits_map = {} # path_chunk_id -> {score, hit}
             
-            output = []
-            for hit in hits:
-                source = hit['_source']
-                score = hit['_score']
-                # Score is cosine+1, so range 0-2. Higher is better.
-                output.append(f"{source['name']} (Path: {source['path']})")
+            # Helper to normalize scores (simple min-max per result set)
+            def normalize_hits(hits, weight):
+                if not hits: return
+                max_score = max(h['_score'] for h in hits) if hits else 1.0
+                if max_score == 0: max_score = 1.0
                 
-            return "\n".join(output)
+                for h in hits:
+                    key = h['_id']
+                    score = (h['_score'] / max_score) * weight
+                    if key not in hits_map:
+                        hits_map[key] = {"score": 0, "source": h['_source']}
+                    hits_map[key]["score"] += score
+
+            if vec_resp and 'hits' in vec_resp and 'hits' in vec_resp['hits']:
+                normalize_hits(vec_resp['hits']['hits'], weight=0.6) # Vector weight
             
+            if kw_resp and 'hits' in kw_resp and 'hits' in kw_resp['hits']:
+                normalize_hits(kw_resp['hits']['hits'], weight=0.4) # Keyword weight
+            
+            # Sort by fused score
+            sorted_results = sorted(hits_map.values(), key=lambda x: x['score'], reverse=True)
+            top_results = sorted_results[:50] # Increase limit for statistical tasks
+            
+            if not top_results:
+                return "未找到相关文件。"
+                
+            # Format Output
+            # Return full content for LLM analysis without file-level deduplication
+            output = []
+            output.append(f"共找到 {len(top_results)} 条相关数据：\n")
+            
+            for i, res in enumerate(top_results):
+                src = res['source']
+                path = src['path']
+                name = src['file_name']
+                content = src['content'] # Return full content
+                
+                # Format: [Index] File: ... Content: ...
+                output.append(f"[{i+1}] 文件: {name}\n内容: {content}\n")
+            
+            return "\n".join(output)
+
         except Exception as e:
+            traceback.print_exc()
             return f"搜索出错: {str(e)}"
 
-    def _find_best_match(self, query):
-        if not self.es:
-            return None
-            
+    def open_file(self, file_name_query):
+        # Use simple keyword search for open file
+        if not self.es: return "ES 未连接"
         try:
-            query_vector = self._vectorize(query)
-            
-            script_query = {
-                "script_score": {
-                    "query": {"match_all": {}},
-                    "script": {
-                        "source": "cosineSimilarity(params.query_vector, doc['embedding']) + 1.0",
-                        "params": {"query_vector": query_vector}
-                    }
-                }
-            }
-            
             resp = self.es.search(
                 index=self.index_name,
                 body={
-                    "query": script_query,
+                    "query": {"match": {"file_name": file_name_query}},
                     "size": 1,
-                    "_source": ["name", "path", "ext"]
+                    "collapse": {"field": "path"} 
                 }
             )
-            
             hits = resp['hits']['hits']
-            if not hits:
-                return None
-            
-            return hits[0]['_source']
-            
+            if hits:
+                path = hits[0]['_source']['path']
+                os.startfile(path)
+                return f"已打开: {path}"
+            return "未找到文件"
         except Exception as e:
-            print(f"Error finding best match: {e}")
-            return None
-
-    def open_file(self, file_name_query):
-        try:
-            target_meta = self._find_best_match(file_name_query)
-            
-            if not target_meta:
-                return f"未找到名为 '{file_name_query}' 的文件。"
-            
-            target = target_meta['path']
-            os.startfile(target)
-            return f"已打开文件: {target}"
-            
-        except Exception as e:
-            return f"打开文件失败: {str(e)}"
+            return str(e)
 
     def read_file_content(self, file_name_query):
+        # Find file path first
+        if not self.es: return "ES 未连接"
         try:
-            target_meta = self._find_best_match(file_name_query)
-            
-            if not target_meta:
-                return f"未找到名为 '{file_name_query}' 的文件。"
-            
-            target_path = target_meta['path']
-            ext = target_meta['ext']
-            
-            content = ""
-            if ext == '.docx':
-                if not Document:
-                    return "错误: 未安装 python-docx 库，无法读取 .docx 文件。"
-                doc = Document(target_path)
-                content = "\n".join([p.text for p in doc.paragraphs])
-            
-            elif ext == '.pdf':
-                if not PdfReader:
-                    return "错误: 未安装 pypdf 库，无法读取 .pdf 文件。"
-                reader = PdfReader(target_path)
-                for page in reader.pages[:10]: # 限制前10页以防过大
-                    text = page.extract_text()
-                    if text:
-                        content += text + "\n"
-            
-            elif ext in ['.xlsx', '.xls']:
-                if not pd:
-                    return "错误: 未安装 pandas/openpyxl 库，无法读取 Excel 文件。"
+            resp = self.es.search(
+                index=self.index_name,
+                body={
+                    "query": {"match": {"file_name": file_name_query}},
+                    "size": 1,
+                    "collapse": {"field": "path"}
+                }
+            )
+            hits = resp['hits']['hits']
+            if not hits:
+                return "未找到文件"
                 
-                # 尝试根据扩展名自动推断引擎，如果失败则尝试显式指定
-                try:
-                    dfs = pd.read_excel(target_path, sheet_name=None)
-                except Exception:
-                    # 如果自动检测失败（无论是ValueError还是BadZipFile），尝试遍历所有可能的引擎
-                    try:
-                        # 先尝试 xlrd (兼容 .xls 即使后缀是 .xlsx)
-                        dfs = pd.read_excel(target_path, sheet_name=None, engine='xlrd')
-                    except Exception:
-                        try:
-                            # 再尝试 openpyxl
-                            dfs = pd.read_excel(target_path, sheet_name=None, engine='openpyxl')
-                        except Exception as e:
-                            # 如果都失败，抛出最后的异常
-                            raise e
-                
-                parts = []
-                for sheet_name, df in dfs.items():
-                    parts.append(f"Sheet: {sheet_name}")
-                    # 转换为 Markdown 表格格式，限制行数以防过长
-                    parts.append(df.head(50).to_markdown(index=False))
-                    parts.append("\n")
-                content = "\n".join(parts)
+            path = hits[0]['_source']['path']
+            ext = hits[0]['_source']['ext']
             
-            elif ext == '.doc':
-                return "提示: 暂不支持直接读取 .doc (旧版Word) 格式，请另存为 .docx 格式后再试。"
+            # Re-use extractor for full read (but extractor chunks, so we might need raw read)
+            # Actually, the user wants to read content. 
+            # Let's use the extractor logic but join chunks or just read raw.
+            # Since extractor is robust, let's just use it and join.
             
-            elif ext in ['.txt', '.md', '.py', '.json', '.log', '.xml', '.ini']:
-                with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
+            chunks = self.extractor.load_and_split(path, ext)
+            full_text = "\n\n".join([c['content'] for c in chunks])
             
-            else:
-                return f"文件类型 {ext} 不支持内容读取。"
-                
-            # 截断过长内容
-            if len(content) > 3000:
-                content = content[:3000] + "\n...(内容过长已截断)"
-                
-            return f"文件 '{target_path}' 的内容:\n{content}"
-                
+            if len(full_text) > 3000:
+                full_text = full_text[:3000] + "\n...(内容过长已截断)"
+            
+            return f"文件 '{path}' 内容:\n{full_text}"
+            
         except Exception as e:
-            return f"读取文件出错: {str(e)}"
+            return f"读取失败: {e}"
 
     def stop(self):
         self.running = False

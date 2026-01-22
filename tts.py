@@ -191,10 +191,27 @@ class TTSHandler:
         try:
             # 使用 ffplay 播放，-nodisp 不显示窗口，-autoexit 播放完退出，-hide_banner 隐藏版权信息
             cmd = ['ffplay', '-nodisp', '-autoexit', '-hide_banner', self.output_path]
-            # 阻塞调用，直到播放结束
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 使用 Popen 以便可以控制进程
+            self.process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.process.wait()
         except Exception as e:
             print(f"Error playing audio: {e}")
+        finally:
+            self.process = None
+
+    def stop_audio(self):
+        if hasattr(self, 'process') and self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=1)
+            except Exception as e:
+                print(f"Error stopping audio: {e}")
+                # Force kill if terminate fails
+                try:
+                    self.process.kill()
+                except:
+                    pass
+            self.process = None
 
     def delete_audio(self):
         if os.path.exists(self.output_path):

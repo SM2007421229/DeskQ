@@ -308,6 +308,8 @@ class AudioRecorder(QWidget):
         self.current_device_name = None
         self.ai_response_buffer = "" # 缓存AI回答
         self.tts_triggered = False # 是否已触发TTS
+        self.tts_handler = None # TTS 处理器
+        self.sound_effect_process = None # 音效播放进程
 
         # 读取配置文件
         self.config = self.load_config()
@@ -535,7 +537,27 @@ class AudioRecorder(QWidget):
         api_key = asr_config.get('apikey', 'fdeebb4ad3414ce3d9ea703dc2a7369a')
         api_secret = asr_config.get('appSecret', 'M2ZhN2NmOTU5MTk5YTAzNjNlYTY1MDFi')
         
-        tts.run_tts_task(text, app_id, api_key, api_secret)
+        # 改为直接使用 TTSHandler 以便管理生命周期
+        # 停止上一个（如果有）
+        if self.tts_handler:
+            self.tts_handler.stop_audio()
+
+        self.tts_handler = tts.TTSHandler(app_id, api_key, api_secret)
+        print(f"Starting Smart TTS for: {text}")
+        
+        try:
+            if self.tts_handler.generate_audio(text):
+                print("Playing Smart TTS audio...")
+                # play_audio 现在会阻塞等待播放完成，或者直到被 terminate
+                self.tts_handler.play_audio()
+                print("Deleting Smart TTS audio...")
+                self.tts_handler.delete_audio()
+            else:
+                print("Smart TTS generation failed.")
+        except Exception as e:
+            print(f"TTS run error: {e}")
+        finally:
+            self.tts_handler = None
 
     def update_knowledge_base(self):
         self.update_status_signal.emit("正在更新知识库...")
@@ -713,10 +735,46 @@ class AudioRecorder(QWidget):
         if not os.path.exists(file_path):
             return
         try:
-            subprocess.run(['ffplay', '-nodisp', '-autoexit', '-hide_banner', file_path],
-                           check=True)
+            # 停止之前的音效（如果还在播放）
+            if self.sound_effect_process and self.sound_effect_process.poll() is None:
+                try:
+                    self.sound_effect_process.terminate()
+                    self.sound_effect_process.wait(timeout=0.5)
+                except:
+                    pass
+            
+            # 异步播放，保存进程对象以便停止
+            self.sound_effect_process = subprocess.Popen(['ffplay', '-nodisp', '-autoexit', '-hide_banner', file_path],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             print(f"Error playing audio: {e}")
+
+    def stop_all_audio(self):
+        """停止所有正在播放的音频（TTS和音效）"""
+        # 停止音效
+        if self.sound_effect_process and self.sound_effect_process.poll() is None:
+            try:
+                self.sound_effect_process.terminate()
+                self.sound_effect_process.wait(timeout=0.5)
+            except Exception as e:
+                print(f"Error stopping sound effect: {e}")
+            finally:
+                self.sound_effect_process = None
+        
+        # 停止 TTS
+        if self.tts_handler:
+            self.tts_handler.stop_audio()
+    
+    def closeEvent(self, event):
+        """窗口关闭事件处理"""
+        self.stop_all_audio()
+        
+        # 停止录音线程
+        if self.listener:
+            self.listener.stop()
+            self.listener.wait()
+            
+        event.accept()
 
 
 if __name__ == '__main__':

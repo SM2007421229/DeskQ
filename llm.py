@@ -18,7 +18,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.tools import StructuredTool
-import file_manager
+import tool
 
 class StreamCallbackHandler(BaseCallbackHandler):
     def __init__(self, token_queue):
@@ -28,7 +28,7 @@ class StreamCallbackHandler(BaseCallbackHandler):
         self.queue.put(token)
 
 class chat:
-    def __init__(self, api_key, api_url, system_prompt, model="deepseek-v3-250324", file_manager_instance=None):
+    def __init__(self, api_key, api_url, system_prompt, model="deepseek-v3-250324"):
         # 处理 API URL，LangChain/OpenAI SDK 通常需要 Base URL (不带 /chat/completions)
         if api_url and api_url.endswith("/chat/completions"):
             api_url = api_url.replace("/chat/completions", "")
@@ -44,25 +44,7 @@ class chat:
         
         self.store = {}
         
-        tools = []
-        if file_manager_instance:
-            def _query_files(query: str = "") -> str:
-                return file_manager_instance.query_files(query or "")
-            def _open_file(filename: str) -> str:
-                return file_manager_instance.open_file(filename)
-                
-            tools = [
-                StructuredTool.from_function(
-                    func=_query_files,
-                    name="query_files",
-                    description="Search for files in the knowledge base. Useful when user asks 'what files do I have' or looks for a document. If query is empty, lists all files."
-                ),
-                StructuredTool.from_function(
-                    func=_open_file,
-                    name="open_file",
-                    description="Open a specific file by name. Useful when user asks to 'open' a file."
-                )
-            ]
+        tools = tool.get_tools()
 
         # 始终使用 Agent 模式
         self.prompt = ChatPromptTemplate.from_messages([

@@ -326,8 +326,7 @@ class AudioRecorder(QWidget):
             api_key=llm_config.get('apikey'),
             api_url=llm_config.get('apiUrl'),
             system_prompt=llm_config.get('system_prompt', ''),
-            model=llm_config.get('model'),
-            file_manager_instance=self.file_manager
+            model=llm_config.get('model')
         )
 
         # 绑定问答界面更新事件

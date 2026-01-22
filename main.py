@@ -11,6 +11,7 @@ import scipy.signal
 import scipy.io.wavfile
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QMessageBox, QHBoxLayout, QPushButton, QLabel, QSpacerItem, QSizePolicy)
 from PyQt6.QtCore import QProcess, QThread, pyqtSignal, QUrl, QObject, pyqtSlot, QFileInfo, Qt, QSize, QEvent
+from PyQt6.QtGui import QDesktopServices, QKeySequence, QShortcut
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebChannel import QWebChannel
 import asr
@@ -20,7 +21,8 @@ import tts
 
 
 # 设置 QtWebEngine 禁用 GPU 加速，解决 0xC0000409 崩溃问题
-os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
+# 同时通过 flags 设置远程调试端口，双重保险
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu --remote-debugging-port=8333"
 os.environ["QTWEBENGINE_REMOTE_DEBUGGING_PORT"] = "8333"
 
 class Backend(QObject):
@@ -334,6 +336,14 @@ class AudioRecorder(QWidget):
         self.update_status_signal.connect(self.handle_status_update)
         self.update_awake_signal.connect(self.handle_awake_update)
 
+        # F12 快捷键打开调试页面
+        self.debug_shortcut = QShortcut(QKeySequence("F12"), self)
+        self.debug_shortcut.activated.connect(self.open_debug_view)
+
+    def open_debug_view(self):
+        print("Opening debug view...")
+        QDesktopServices.openUrl(QUrl("http://localhost:8333"))
+
     def changeEvent(self, event):
         if event.type() == QEvent.Type.WindowStateChange:
             if self.windowState() & Qt.WindowState.WindowMaximized:
@@ -414,6 +424,7 @@ class AudioRecorder(QWidget):
 
         # Web Engine View
         self.web_view = QWebEngineView()
+        # self.web_view.settings().setAttribute(QWebEngineSettings.WebAttribute.DeveloperExtrasEnabled, True)
         
         # Setup WebChannel
         self.channel = QWebChannel()
@@ -492,15 +503,16 @@ class AudioRecorder(QWidget):
                     threading.Thread(target=self.run_tts, args=(first_sentence,)).start()
             
             # 转义字符以供 JS 使用
-            js_chunk = chunk.replace('\\', '\\\\').replace("'", "\\'").replace('\n', '\\n').replace('\r', '')
-            self.web_view.page().runJavaScript(f"appendAiStream('{js_chunk}');")
+            # 使用 json.dumps 安全处理所有特殊字符（包括 LaTeX 反斜杠、换行符等）
+            js_chunk = json.dumps(chunk)
+            self.web_view.page().runJavaScript(f"appendAiStream({js_chunk});")
             
         elif text.startswith("提问: "):
-            content = text[4:].replace('\\', '\\\\').replace("'", "\\'")
-            self.web_view.page().runJavaScript(f"addUserMessage('{content}');")
+            content = json.dumps(text[4:])
+            self.web_view.page().runJavaScript(f"addUserMessage({content});")
         elif text.startswith("用户: "):
-            content = text[4:].replace('\\', '\\\\').replace("'", "\\'")
-            self.web_view.page().runJavaScript(f"addUserMessage('{content}');")
+            content = json.dumps(text[4:])
+            self.web_view.page().runJavaScript(f"addUserMessage({content});")
         elif text == "回答: ":
             self.ai_response_buffer = "" # 重置缓冲区
             self.tts_triggered = False # 重置TTS触发状态
@@ -708,6 +720,10 @@ class AudioRecorder(QWidget):
 
 
 if __name__ == '__main__':
+    # 确保参数传递给 Chromium
+    if "--remote-debugging-port=8333" not in sys.argv:
+        sys.argv.append("--remote-debugging-port=8333")
+        
     app = QApplication(sys.argv)
     ex = AudioRecorder()
     ex.show()

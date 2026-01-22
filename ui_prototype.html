@@ -161,7 +161,7 @@
             align-items: center;
             justify-content: center;
             flex-shrink: 0;
-            font-size: 13px;
+            font-size: 15px;
             border: 1px solid #475569;
             margin-top: 2px;
         }
@@ -183,7 +183,7 @@
             padding: 6px 12px;
             border-radius: var(--border-radius);
             position: relative;
-            font-size: 12px;
+            font-size: 14px;
             line-height: 1.6;
             box-shadow: var(--shadow-sm);
         }
@@ -211,7 +211,7 @@
             padding: 6px 12px;
             border-radius: 16px;
             font-weight: 600;
-            font-size: 13px;
+            font-size: 15px;
             display: flex;
             align-items: center;
             gap: 8px;
@@ -232,7 +232,7 @@
             padding: 10px 12px;
             border-radius: 16px;
             border-top-left-radius: 4px;
-            font-size: 12px;
+            font-size: 14px;
             border: 1px solid #475569;
         }
 
@@ -376,6 +376,28 @@
 
     <script src="js/qwebchannel.js"></script>
     <script src="js/marked.min.js"></script>
+    
+    <!-- MathJax 3 Configuration -->
+    <script>
+    window.MathJax = {
+      tex: {
+        inlineMath:  [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']]
+      },
+      svg: { fontCache: 'global' },
+      startup: {
+        pageReady: () => {
+            console.log('MathJax is ready to process page');
+            return MathJax.startup.defaultPageReady();
+        }
+      }
+    };
+    </script>
+    <!-- 使用本地 MathJax (已下载到 js/mathjax.min.js) -->
+    <script async id="MathJax-script" src="js/mathjax.min.js"
+        onload="console.log('Local MathJax script loaded successfully')"
+        onerror="console.error('Failed to load local MathJax script. Please check js/mathjax.min.js')"></script>
+    
     <script>
         let backend = null;
         
@@ -483,14 +505,69 @@
                     currentAiDetail.className = 'ai-detail-card';
                     currentAiContainer.appendChild(currentAiDetail);
                 }
-                // Use marked.js to render Markdown
-                currentAiDetail.innerHTML = marked.parse(detailText);
+                
+                // Protect Math
+                const mathMap = new Map();
+                let mathId = 0;
+                
+                let protectedText = detailText;
+
+                // Protect block math $$...$$
+                protectedText = protectedText.replace(/\$\$([\s\S]+?)\$\$/g, (match, p1) => {
+                    const id = `MATH_BLOCK_SS_${mathId++}_END`;
+                    mathMap.set(id, match); // Store original match including $$
+                    return id;
+                });
+                
+                // Protect block math \[...\]
+                protectedText = protectedText.replace(/\\\[([\s\S]+?)\\\]/g, (match, p1) => {
+                    const id = `MATH_BLOCK_SB_${mathId++}_END`;
+                    mathMap.set(id, match);
+                    return id;
+                });
+
+                // Protect inline math \(...\)
+                protectedText = protectedText.replace(/\\\(([\s\S]+?)\\\)/g, (match, p1) => {
+                    const id = `MATH_INLINE_P_${mathId++}_END`;
+                    mathMap.set(id, match);
+                    return id;
+                });
+                
+                // Protect inline math $...$
+                protectedText = protectedText.replace(/\$([^$\n]+?)\$/g, (match, p1) => {
+                    const id = `MATH_INLINE_D_${mathId++}_END`;
+                    mathMap.set(id, match);
+                    return id;
+                });
+ 
+                // Parse Markdown
+                let html = marked.parse(protectedText);
+                
+                // Restore Math (Directly, no escaping)
+                mathMap.forEach((original, key) => {
+                    html = html.replace(key, () => original);
+                });
+
+                currentAiDetail.innerHTML = html;
+                
+                // Render Math with MathJax
+                // 移除流式渲染，避免频繁重绘导致的状态丢失
+                // if (window.MathJax && window.MathJax.typesetPromise) {
+                //    window.MathJax.typesetPromise([currentAiDetail])
+                //        .catch((err) => console.log('MathJax error:', err));
+                // }
             }
             
             scrollToBottom();
         }
 
         function endAiMessage() {
+            // 最终渲染：在消息接收完毕后统一渲染公式，确保稳定性
+            if (currentAiDetail && window.MathJax && window.MathJax.typesetPromise) {
+                 window.MathJax.typesetPromise([currentAiDetail])
+                    .catch((err) => console.log('MathJax final render error:', err));
+            }
+            
             currentAiContainer = null;
             currentAiSummary = null;
             currentAiDetail = null;

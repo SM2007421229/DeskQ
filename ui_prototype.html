@@ -257,6 +257,7 @@
         }
         
         /* 代码块样式适配暗色 */
+        /* Inline code */
         code {
             background-color: #0f172a;
             padding: 2px 6px;
@@ -264,6 +265,66 @@
             font-family: Consolas, Monaco, 'Andale Mono', monospace;
             color: #e2e8f0;
             border: 1px solid #334155;
+        }
+
+        /* Block code wrapper */
+        .code-block-wrapper {
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            margin: 12px 0;
+            overflow: hidden;
+        }
+
+        .code-block-header {
+            background-color: #1e293b;
+            border-bottom: 1px solid #334155;
+            padding: 6px 12px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .code-lang {
+            font-size: 12px;
+            color: #94a3b8;
+            font-family: monospace;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+
+        .copy-btn {
+            background: transparent;
+            border: none;
+            color: #94a3b8;
+            cursor: pointer;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+
+        .copy-btn:hover {
+            background-color: #334155;
+            color: #f1f5f9;
+        }
+
+        .code-block-wrapper pre {
+            margin: 0;
+            padding: 12px;
+            overflow-x: auto;
+        }
+
+        /* Override inline code style when inside pre */
+        .code-block-wrapper pre code {
+            background-color: transparent;
+            border: none;
+            padding: 0;
+            color: #e2e8f0;
+            font-size: 13px;
         }
 
         /* 底部悬浮麦克风 */
@@ -400,6 +461,62 @@
     
     <script>
         let backend = null;
+        
+        // Configure Marked Renderer for Custom Code Blocks
+        const renderer = new marked.Renderer();
+        renderer.code = function(code, language) {
+            const lang = (language || 'text').trim();
+            // Escape code to prevent HTML injection
+            const escapedCode = code.replace(/&/g, "&amp;")
+                                    .replace(/</g, "&lt;")
+                                    .replace(/>/g, "&gt;")
+                                    .replace(/"/g, "&quot;")
+                                    .replace(/'/g, "&#039;");
+            
+            return `
+        <div class="code-block-wrapper">
+            <div class="code-block-header">
+                <span class="code-lang">${lang}</span>
+                <button class="copy-btn" onclick="copyCode(this)">
+                    <span>📋</span> 复制
+                </button>
+            </div>
+            <pre><code class="language-${lang}">${escapedCode}</code></pre>
+        </div>
+        `;
+        };
+
+        marked.setOptions({
+            renderer: renderer,
+            highlight: null,
+            breaks: true
+        });
+
+        // Copy Code Function
+        window.copyCode = function(btn) {
+            const wrapper = btn.closest('.code-block-wrapper');
+            const code = wrapper.querySelector('code').innerText;
+            
+            // Create a temporary textarea to copy text
+            const textarea = document.createElement('textarea');
+            textarea.value = code;
+            document.body.appendChild(textarea);
+            textarea.select();
+            
+            try {
+                document.execCommand('copy');
+                const originalContent = btn.innerHTML;
+                btn.innerHTML = '<span>✅</span> 已复制';
+                setTimeout(() => {
+                    btn.innerHTML = originalContent;
+                }, 2000);
+            } catch (err) {
+                console.error('Failed to copy', err);
+                btn.innerHTML = '<span>❌</span> 失败';
+            }
+            
+            document.body.removeChild(textarea);
+        };
         
         // Initialize WebChannel
         new QWebChannel(qt.webChannelTransport, function(channel) {

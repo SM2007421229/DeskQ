@@ -543,7 +543,7 @@ class FileManager:
                     # Path A: Vector Candidates
                     vec_resp = self.es.search(
                         index=self.index_name,
-                        body={"query": vector_query, "size": 20, "_source": ["file_name", "path", "content"]}
+                        body={"query": vector_query, "size": 50, "_source": ["file_name", "path", "content"]}
                     )
                 except Exception as e:
                     print(f"Vector search failed: {e}")
@@ -564,7 +564,7 @@ class FileManager:
             # Path B: Keyword Candidates
             kw_resp = self.es.search(
                 index=self.index_name,
-                body={"query": keyword_query, "size": 20, "_source": ["file_name", "path", "content"]}
+                body={"query": keyword_query, "size": 50, "_source": ["file_name", "path", "content"]}
             )
             
             # Fuse Results (Weighted Sum of normalized scores)
@@ -637,41 +637,6 @@ class FileManager:
             return "未找到文件"
         except Exception as e:
             return str(e)
-
-    def read_file_content(self, file_name_query):
-        # Find file path first
-        if not self.es: return "ES 未连接"
-        try:
-            resp = self.es.search(
-                index=self.index_name,
-                body={
-                    "query": {"match": {"file_name": file_name_query}},
-                    "size": 1,
-                    "collapse": {"field": "path"}
-                }
-            )
-            hits = resp['hits']['hits']
-            if not hits:
-                return "未找到文件"
-                
-            path = hits[0]['_source']['path']
-            ext = hits[0]['_source']['ext']
-            
-            # Re-use extractor for full read (but extractor chunks, so we might need raw read)
-            # Actually, the user wants to read content. 
-            # Let's use the extractor logic but join chunks or just read raw.
-            # Since extractor is robust, let's just use it and join.
-            
-            chunks = self.extractor.load_and_split(path, ext)
-            full_text = "\n\n".join([c['content'] for c in chunks])
-            
-            if len(full_text) > 3000:
-                full_text = full_text[:3000] + "\n...(内容过长已截断)"
-            
-            return f"文件 '{path}' 内容:\n{full_text}"
-            
-        except Exception as e:
-            return f"读取失败: {e}"
 
     def stop(self):
         self.running = False

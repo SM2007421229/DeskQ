@@ -50,8 +50,6 @@ class chat:
                 return file_manager_instance.query_files(query or "")
             def _open_file(filename: str) -> str:
                 return file_manager_instance.open_file(filename)
-            def _read_file(filename: str) -> str:
-                return file_manager_instance.read_file_content(filename)
                 
             tools = [
                 StructuredTool.from_function(
@@ -63,11 +61,6 @@ class chat:
                     func=_open_file,
                     name="open_file",
                     description="Open a specific file by name. Useful when user asks to 'open' a file."
-                ),
-                StructuredTool.from_function(
-                    func=_read_file,
-                    name="read_file_content",
-                    description="Read the content of a file. Useful when user asks to summarize a document or asks about its content."
                 )
             ]
 

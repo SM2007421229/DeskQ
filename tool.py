@@ -200,7 +200,7 @@ def get_tools():
                     # Path A: Vector Candidates
                     vec_resp = fm.es.search(
                         index=fm.index_name,
-                        body={"query": vector_query, "size": 50, "_source": ["file_name", "path", "content"]}
+                        body={"query": vector_query, "size": 50, "_source": ["file_name", "path", "content", "chunk_id", "chunk_seq", "parent_id", "ancestor_ids", "level", "type"]}
                     )
                 except Exception as e:
                     print(f"Vector search failed: {e}")
@@ -221,7 +221,7 @@ def get_tools():
             # Path B: Keyword Candidates
             kw_resp = fm.es.search(
                 index=fm.index_name,
-                body={"query": keyword_query, "size": 50, "_source": ["file_name", "path", "content"]}
+                body={"query": keyword_query, "size": 50, "_source": ["file_name", "path", "content", "chunk_id", "chunk_seq", "parent_id", "ancestor_ids", "level", "type"]}
             )
             
             # Fuse Results (Weighted Sum of normalized scores)
@@ -261,13 +261,14 @@ def get_tools():
             
             for i, res in enumerate(top_results):
                 src = res['source']
-                path = src['path']
                 name = src['file_name']
                 content = src['content'] # Return full content
                 
-                # Format: [Index] File: ... Content: ...
-                output.append(f"[{i+1}] 文件: {name}\n内容: {content}\n")
-            
+                chunk_id = src.get('chunk_id')
+                
+                # Format: [Index] ID: ... File: ... Content: ...
+                output.append(f"[{i+1}] ID: {chunk_id} 文件: {name}\n内容: {content}\n")
+
             return "\n".join(output)
 
         except Exception as e:
@@ -285,22 +286,104 @@ def get_tools():
         # Use simple keyword search for open file
         if not fm.es: return "ES 未连接"
         try:
+            # First try exact match on path if query looks like path
+            if os.path.isabs(file_name_query) and os.path.exists(file_name_query):
+                os.startfile(file_name_query)
+                return f"已打开: {file_name_query}"
+
+            # Search by filename
             resp = fm.es.search(
                 index=fm.index_name,
                 body={
                     "query": {"match": {"file_name": file_name_query}},
                     "size": 1,
-                    "collapse": {"field": "path"} 
+                    # Remove collapse to avoid errors if field type is issue
+                    "_source": ["path"]
                 }
             )
             hits = resp['hits']['hits']
             if hits:
                 path = hits[0]['_source']['path']
-                os.startfile(path)
-                return f"已打开: {path}"
+                if os.path.exists(path):
+                    os.startfile(path)
+                    return f"已打开: {path}"
+                else:
+                     return f"文件不存在: {path}"
             return "未找到文件"
         except Exception as e:
-            return str(e)
+            traceback.print_exc()
+            return f"打开文件失败: {str(e)}"
+
+    def fetch_section_content(chunk_ids: list) -> str:
+        """
+        Fetch full content for specific sections/headings by their chunk IDs.
+        Retrieves all descendant text (children, sub-sections) for the given chunks.
+        """
+        fm = file_manager.instance
+        if not fm or not fm.es:
+            return "ES not initialized."
+            
+        try:
+            if not chunk_ids:
+                return "No chunk IDs provided."
+                
+            # Search for chunks where ancestor_ids contain any of the provided chunk_ids
+            # Also include the chunks themselves
+            # User request: "query all parent_id=chunk_id text" -> we interpret this as subtree retrieval
+            
+            should_clauses = []
+            for cid in chunk_ids:
+                # Match chunks that have this ID as ancestor
+                should_clauses.append({"term": {"ancestor_ids": cid}})
+                # Match chunks that have this ID as parent (redundant if ancestor_ids logic is correct but safe)
+                should_clauses.append({"term": {"parent_id": cid}})
+                # Match the chunk itself
+                should_clauses.append({"term": {"chunk_id": cid}})
+            
+            query = {
+                "bool": {
+                    "should": should_clauses,
+                    "minimum_should_match": 1
+                }
+            }
+            
+            resp = fm.es.search(
+                index=fm.index_name,
+                body={
+                    "query": query,
+                    "size": 1000, # Large size for full section
+                    "sort": [
+                        {"path": "asc"}, # Group by file
+                        {"chunk_seq": "asc"} # Then by sequence
+                    ],
+                    "_source": ["content", "chunk_id", "type", "file_name"]
+                }
+            )
+            
+            hits = resp['hits']['hits']
+            if not hits:
+                return "No content found for provided IDs."
+            
+            # Assemble content
+            output = []
+            current_file = ""
+            
+            for h in hits:
+                src = h['_source']
+                fname = src.get('file_name', 'Unknown')
+                content = src.get('content', '')
+                
+                if fname != current_file:
+                    output.append(f"\n--- File: {fname} ---")
+                    current_file = fname
+                    
+                output.append(content)
+            
+            return "\n".join(output)
+            
+        except Exception as e:
+            traceback.print_exc()
+            return f"Error fetching section content: {str(e)}"
 
     return [
         StructuredTool.from_function(
@@ -309,9 +392,14 @@ def get_tools():
             description="Search for files in the knowledge base. MUST be used when user asks for specific data, reports, 'what files do I have', or when a calculation requires external data. If query is empty, lists all files."
         ),
         StructuredTool.from_function(
+            func=fetch_section_content,
+            name="fetch_section_content",
+            description="Fetch full content for specific sections/headings (PDF/Doc) by their chunk_ids. Use this when you need to read the details of a specific section returned by query_files."
+        ),
+        StructuredTool.from_function(
             func=open_file,
             name="open_file",
-            description="Open a specific file by name. Useful when user asks to 'open' a file."
+            description="Open a specific file in the local OS (e.g. launch PDF viewer). DO NOT use this tool to read/analyze content. Only use when user explicitly asks to 'open' or 'launch' a file."
         ),
         StructuredTool.from_function(
             func=calc_sum_desc,

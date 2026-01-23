@@ -20,28 +20,17 @@ except ImportError:
     HAS_LANGCHAIN = False
 
 try:
-    from docx import Document
-except ImportError:
-    Document = None
-
-try:
     from pypdf import PdfReader
 except ImportError:
     PdfReader = None
 
 try:
-    from pptx import Presentation
+    import pdfplumber
 except ImportError:
-    Presentation = None
+    pdfplumber = None
 
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    BeautifulSoup = None
-
-import openpyxl
-
-# --- Helper Classes ---
+import re
+import uuid
 
 
 class ContentExtractor:
@@ -56,24 +45,353 @@ class ContentExtractor:
         else:
             self.text_splitter = None
 
+    def _split_text_custom(self, text, parent_id=None):
+        """
+        Splits text according to user rules:
+        1. Split by punctuation: 。;！?\.!?;
+        2. If > threshold, split by ,
+        3. Assign group_id and seq.
+        """
+        chunks = []
+        if not text:
+            return chunks
+            
+        # Split by punctuation, keeping the delimiter
+        parts = re.split(r'([。;！\?\.!?;])', text)
+        
+        sentences = []
+        current_sent = ""
+        for p in parts:
+            if re.match(r'[。;！\?\.!?;]', p):
+                current_sent += p
+                sentences.append(current_sent)
+                current_sent = ""
+            else:
+                current_sent += p
+        if current_sent:
+            sentences.append(current_sent)
+            
+        for sent in sentences:
+            if not sent.strip():
+                continue
+                
+            group_id = str(uuid.uuid4())
+            # Rule 4: Recursive split by comma if too long
+            sub_chunks = self._recursive_split(sent, max_len=300)
+            
+            for i, sub in enumerate(sub_chunks):
+                chunks.append({
+                    "content": sub,
+                    "group_id": group_id,
+                    "seq": i,
+                    "parent_id": parent_id,
+                    "type": "text"
+                })
+        return chunks
+
+    def _recursive_split(self, text, max_len=300):
+        if len(text) <= max_len:
+            return [text]
+            
+        # Split by comma
+        parts = re.split(r'([,，])', text)
+        result = []
+        current = ""
+        
+        for p in parts:
+            if len(current) + len(p) > max_len:
+                if current:
+                    result.append(current)
+                current = p
+            else:
+                current += p
+        if current:
+            result.append(current)
+            
+        final_result = []
+        for r in result:
+             if len(r) > max_len:
+                 final_result.extend([r[i:i+max_len] for i in range(0, len(r), max_len)])
+             else:
+                 final_result.append(r)
+                 
+        return final_result
+
+    def _process_pdf(self, file_path):
+        if not pdfplumber:
+            return []
+            
+        chunks = []
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                # 1. Global Font Size Analysis (Mode based)
+                all_font_sizes = []
+                # Sample first 10 pages or all pages for better stats
+                sample_pages = pdf.pages[:10] if len(pdf.pages) > 10 else pdf.pages
+                
+                for page in sample_pages:
+                    words = page.extract_words(extra_attrs=['size'])
+                    for w in words:
+                        if w['text'].strip():
+                            # Round to nearest integer for robust mode calculation
+                            all_font_sizes.append(round(w['size']))
+                
+                body_size = 12.0 # Default fallback
+                if all_font_sizes:
+                    # Calculate Mode
+                    from collections import Counter
+                    counts = Counter(all_font_sizes)
+                    body_size = float(counts.most_common(1)[0][0])
+                
+                # Dynamic Thresholds
+                # Use additive thresholds instead of multipliers to be more robust against small font variations
+                h1_threshold = body_size + 4.0 
+                h2_threshold = body_size + 2.0
+                
+                # 2. Hierarchy Stack: [(chunk_id, level, title_text)]
+                # level: 1 (H1), 2 (H2), 3 (H3)
+                heading_stack = [] 
+                
+                global_seq = 0
+                
+                for i, page in enumerate(pdf.pages):
+                    page_num = i + 1
+                    
+                    # 3. Extract Tables
+                    table_bboxes = []
+                    found_tables = page.find_tables()
+                    for table in found_tables:
+                        table_bboxes.append(table.bbox)
+                        data = table.extract()
+                        if not data: continue
+                        
+                        headers = []
+                        start_row = 0
+                        if len(data) > 0:
+                            headers = [str(c).strip().replace('\n', ' ') if c else f"Col{j}" for j, c in enumerate(data[0])]
+                            start_row = 1
+                        
+                        for row in data[start_row:]:
+                            row_parts = []
+                            for col_idx, cell in enumerate(row):
+                                if col_idx < len(headers):
+                                    col_name = headers[col_idx]
+                                    val = str(cell).strip().replace('\n', ' ') if cell else ""
+                                    if val:
+                                        row_parts.append(f"{col_name}:{val}")
+                            
+                            if row_parts:
+                                content = ",".join(row_parts)
+                                
+                                # Determine Parent
+                                current_parent_id = heading_stack[-1][0] if heading_stack else None
+                                current_ancestors = [h[0] for h in heading_stack]
+                                
+                                chunks.append({
+                                    "chunk_id": str(uuid.uuid4()),
+                                    "content": f"[Page {page_num} Table] {content}",
+                                    "type": "table",
+                                    "parent_id": current_parent_id,
+                                    "ancestor_ids": current_ancestors,
+                                    "level": 0,
+                                    "chunk_seq": global_seq,
+                                    "page": page_num
+                                })
+                                global_seq += 1
+
+                    # 4. Extract Text
+                    def not_inside_tables(obj):
+                        x0, top, x1, bottom = obj['x0'], obj['top'], obj['x1'], obj['bottom']
+                        mid_x = (x0 + x1) / 2
+                        mid_y = (top + bottom) / 2
+                        for bbox in table_bboxes:
+                            if (bbox[0] <= mid_x <= bbox[2]) and (bbox[1] <= mid_y <= bbox[3]):
+                                return False
+                        return True
+
+                    text_page = page.filter(not_inside_tables)
+                    words = text_page.extract_words(extra_attrs=['size', 'fontname'])
+                    
+                    # Group words into lines
+                    lines = []
+                    current_line = []
+                    last_top = 0
+                    
+                    for w in words:
+                        if not current_line:
+                            current_line.append(w)
+                            last_top = w['top']
+                        else:
+                            if abs(w['top'] - last_top) < 5:
+                                current_line.append(w)
+                            else:
+                                lines.append(current_line)
+                                current_line = [w]
+                                last_top = w['top']
+                    if current_line:
+                        lines.append(current_line)
+                    
+                    # Process lines with Heading Detection
+                    buffer_text = ""
+                    
+                    for line in lines:
+                        if not line: continue
+                        
+                        avg_size = sum(w['size'] for w in line) / len(line)
+                        line_text = " ".join([w['text'] for w in line]).strip()
+                        if not line_text: continue
+
+                        # Detect Heading Level
+                        level = 0
+                        is_bold = any("Bold" in w.get('fontname', '') for w in line)
+                        
+                        # Punctuation check: Headings rarely end with sentence separators
+                        last_char = line_text.strip()[-1] if line_text.strip() else ""
+                        is_likely_text = last_char in [',', '，', '、', ';', '；', '。']
+                        
+                        # Exception for English period: only exclude if not short numbering like "1."
+                        if last_char == '.':
+                            if len(line_text) > 10 or not re.match(r'^[\d\.]+$', line_text.strip()):
+                                is_likely_text = True
+                        
+                        if avg_size >= h1_threshold:
+                            level = 1
+                        elif avg_size >= h2_threshold:
+                            level = 2
+                        elif not is_likely_text:
+                            if (avg_size >= body_size + 1.0) or (avg_size >= body_size and is_bold and len(line_text) < 60):
+                                level = 3
+                        
+                        if level > 0:
+                            # Flush Buffer (Previous Body Text)
+                            if buffer_text:
+                                # Determine Parent for Buffer (Current Stack Top)
+                                current_parent_id = heading_stack[-1][0] if heading_stack else None
+                                current_ancestors = [h[0] for h in heading_stack]
+                                
+                                # Split text (Rule 4) - Simplified as per request (remove group_id/seq logic within sentence)
+                                # But we still need to split by punctuation for granularity
+                                # Using _split_text_custom but mapping to new structure
+                                
+                                # Direct splitting here to control chunk structure
+                                sub_parts = self._split_text_smart(buffer_text)
+                                for part in sub_parts:
+                                    chunks.append({
+                                        "chunk_id": str(uuid.uuid4()),
+                                        "content": part,
+                                        "type": "text",
+                                        "parent_id": current_parent_id,
+                                        "ancestor_ids": current_ancestors,
+                                        "level": 0,
+                                        "chunk_seq": global_seq,
+                                        "page": page_num
+                                    })
+                                    global_seq += 1
+                                buffer_text = ""
+                            
+                            # Update Stack
+                            # Pop all headings with level >= current level
+                            while heading_stack and heading_stack[-1][1] >= level:
+                                heading_stack.pop()
+                            
+                            # Determine Parent for this Heading (New Stack Top)
+                            parent_heading_id = heading_stack[-1][0] if heading_stack else None
+                            # Ancestors include the parent
+                            heading_ancestors = [h[0] for h in heading_stack]
+                            
+                            new_heading_id = str(uuid.uuid4())
+                            
+                            chunks.append({
+                                "chunk_id": new_heading_id,
+                                "content": line_text,
+                                "type": "heading",
+                                "parent_id": parent_heading_id,
+                                "ancestor_ids": heading_ancestors,
+                                "level": level,
+                                "chunk_seq": global_seq,
+                                "page": page_num
+                            })
+                            global_seq += 1
+                            
+                            # Push to Stack
+                            heading_stack.append((new_heading_id, level, line_text))
+                            
+                        else:
+                            # Body Text Accumulation
+                            buffer_text += line_text + "\n"
+                            
+                    # End of Page Flush
+                    if buffer_text:
+                        current_parent_id = heading_stack[-1][0] if heading_stack else None
+                        current_ancestors = [h[0] for h in heading_stack]
+                        
+                        sub_parts = self._split_text_smart(buffer_text)
+                        for part in sub_parts:
+                            chunks.append({
+                                "chunk_id": str(uuid.uuid4()),
+                                "content": part,
+                                "type": "text",
+                                "parent_id": current_parent_id,
+                                "ancestor_ids": current_ancestors,
+                                "level": 0,
+                                "chunk_seq": global_seq,
+                                "page": page_num
+                            })
+                            global_seq += 1
+                        
+        except Exception as e:
+            print(f"Error processing PDF {file_path}: {e}")
+            traceback.print_exc()
+            
+        return chunks
+
+    def _split_text_smart(self, text):
+        """
+        Smart splitter for PDF body text.
+        Splits by punctuation: 。;！?\.!?;
+        Exception: Dot (.) surrounded by digits (e.g. 3.14) is NOT split.
+        """
+        if not text: return []
+        
+        # Split by the specified punctuation
+        parts = re.split(r'([。;！\?\.!?;])', text)
+        chunks = []
+        current = ""
+        
+        for i, part in enumerate(parts):
+            # If it's a separator
+            if re.match(r'^[。;！\?\.!?;]$', part):
+                # Check for decimal point exception: . surrounded by digits
+                if part == '.':
+                    prev_char = parts[i-1][-1] if i > 0 and parts[i-1] else ''
+                    next_char = parts[i+1][0] if i < len(parts)-1 and parts[i+1] else ''
+                    if prev_char.isdigit() and next_char.isdigit():
+                        current += part
+                        continue
+                
+                # Normal separator behavior
+                current += part
+                if current.strip():
+                    chunks.append(current)
+                current = ""
+            else:
+                current += part
+        
+        if current.strip():
+            chunks.append(current)
+            
+        return [c.strip() for c in chunks if c.strip()]
+
     def load_and_split(self, file_path, ext):
         """
         Extract content from file and split into chunks.
         Returns: List of dicts [{"content": str, "page_info": str}]
         """
         try:
-            raw_text = ""
-            metadata_list = [] # parallel to chunks if possible, or just raw text first
-
-            if ext == '.docx':
-                if Document:
-                    doc = Document(file_path)
-                    raw_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-                else:
-                    return []
-
-            elif ext == '.pdf':
-                if PdfReader:
+            if ext == '.pdf':
+                if pdfplumber:
+                    return self._process_pdf(file_path)
+                elif PdfReader:
                     reader = PdfReader(file_path)
                     texts = []
                     for i, page in enumerate(reader.pages):
@@ -125,35 +443,6 @@ class ContentExtractor:
                 except Exception as e:
                     print(f"Error parsing Excel {file_path}: {e}")
                     return []
-
-            elif ext == '.pptx':
-                if Presentation:
-                    prs = Presentation(file_path)
-                    texts = []
-                    for i, slide in enumerate(prs.slides):
-                        slide_texts = []
-                        if slide.shapes.title:
-                            slide_texts.append(f"Title: {slide.shapes.title.text}")
-                        for shape in slide.shapes:
-                            if hasattr(shape, "text") and shape.text:
-                                slide_texts.append(shape.text)
-                        if slide_texts:
-                            texts.append(f"[Slide {i+1}] " + "\n".join(slide_texts))
-                    raw_text = "\n".join(texts)
-                else:
-                    return []
-
-            elif ext in ['.html', '.htm']:
-                if BeautifulSoup:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        soup = BeautifulSoup(f, 'html.parser')
-                        raw_text = soup.get_text(separator='\n')
-                else:
-                    return []
-
-            elif ext in ['.txt', '.md', '.py', '.json', '.log', '.xml', '.ini', '.yml']:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    raw_text = f.read()
 
             else:
                 return []
@@ -255,7 +544,8 @@ class FileManager:
         
         # Support both legacy and new config keys
         self.monitored_folders = self.config.get('dirs', self.config.get('monitored_folders', []))
-        self.file_types = set(self.config.get('types', self.config.get('file_types', [])))
+        # Hardcoded supported file types
+        self.file_types = {".xlsx", ".xls", ".pdf"}
         self.reindex_interval = self.config.get('watch_interval', self.config.get('reindex_interval', 3600))
 
         # ES Config
@@ -312,9 +602,15 @@ class FileManager:
                 mapping = self.es.indices.get_mapping(index=self.index_name)
                 # Structure: {index_name: {mappings: {properties: {path: {type: ...}}}}}
                 try:
-                    path_type = mapping[self.index_name]['mappings']['properties']['path']['type']
-                    if path_type != 'keyword':
-                        print(f"Index {self.index_name} has incorrect mapping for 'path' ({path_type}). Recreating...")
+                    props = mapping[self.index_name]['mappings']['properties']
+                    path_type = props['path']['type']
+                    
+                    # Check for new fields
+                    has_new_fields = 'chunk_id' in props and 'ancestor_ids' in props and 'level' in props
+                    chunk_id_type = props.get('chunk_id', {}).get('type')
+                    
+                    if path_type != 'keyword' or chunk_id_type != 'keyword' or not has_new_fields:
+                        print(f"Index {self.index_name} schema outdated. Recreating...")
                         self.es.indices.delete(index=self.index_name)
                     else:
                         # Mapping is correct
@@ -326,6 +622,7 @@ class FileManager:
 
             # Create index if not exists (or deleted above)
             if not self.es.indices.exists(index=self.index_name):
+                # Create index with explicit mapping
                 mapping = {
                     "mappings": {
                         "properties": {
@@ -338,7 +635,13 @@ class FileManager:
                                 "type": "dense_vector",
                                 "dims": self.vector_dim
                             },
-                            "chunk_id": {"type": "integer"},
+                            "chunk_id": {"type": "keyword"},
+                            "chunk_seq": {"type": "integer"},
+                            "parent_id": {"type": "keyword"},
+                            "ancestor_ids": {"type": "keyword"},
+                            "level": {"type": "integer"},
+                            "type": {"type": "keyword"},
+                            "page": {"type": "integer"},
                             "created_at": {"type": "date"}
                         }
                     }
@@ -488,8 +791,14 @@ class FileManager:
                                     "mtime": meta['mtime'],
                                     "content": chunk['content'],
                                     "content_vector": vectors[i],
-                                    "chunk_id": chunk['chunk_id'],
-                                    "created_at": datetime.now().isoformat()
+                                    "chunk_id": str(chunk.get('chunk_id', i)),
+                                    "created_at": datetime.now().isoformat(),
+                                    "parent_id": chunk.get('parent_id'),
+                                    "ancestor_ids": chunk.get('ancestor_ids', []),
+                                    "level": chunk.get('level', 0),
+                                    "chunk_seq": chunk.get('chunk_seq', i),
+                                    "page": chunk.get('page'),
+                                    "type": chunk.get('type', 'text')
                                 }
                             }
                             actions.append(doc)

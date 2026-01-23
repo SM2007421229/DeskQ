@@ -393,6 +393,82 @@
             background: #64748b;
         }
 
+        /* Utility */
+        .hidden { display: none !important; }
+
+        /* Mode Toggle Button */
+        .btn-icon {
+            background: transparent;
+            border: 1px solid #334155;
+            color: var(--text-secondary);
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            margin-right: 8px;
+            transition: all 0.2s;
+        }
+        .btn-icon:hover {
+            background-color: #334155;
+            color: var(--text-primary);
+        }
+
+        /* Text Input Area */
+        .text-input-area {
+            background-color: var(--chat-bg);
+            padding: 16px 24px;
+            border-top: 1px solid #334155;
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+            z-index: 20;
+            box-shadow: 0 -4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        .text-input {
+            flex: 1;
+            background-color: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            padding: 8px 12px;
+            color: var(--text-primary);
+            font-family: inherit;
+            font-size: 14px;
+            resize: none;
+            height: 42px;
+            box-sizing: border-box;
+            max-height: 120px;
+            outline: none;
+            transition: border-color 0.2s;
+            line-height: 1.5;
+        }
+
+        .text-input:focus {
+            border-color: var(--primary-color);
+        }
+
+        .btn-send {
+            background-color: var(--primary-dark);
+            color: white;
+            border: none;
+            padding: 0 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background-color 0.2s;
+            height: 42px; /* Match input min-height roughly */
+            display: flex;
+            align-items: center;
+        }
+
+        .btn-send:hover {
+            background-color: #4338ca;
+        }
+
     </style>
 </head>
 <body>
@@ -404,10 +480,13 @@
                 <div class="header-title">
                     <span id="assistantIcon" style="font-size: 20px;">💤</span> 桌面语音助手
                 </div>
+                <button id="modeToggleBtn" class="btn-icon" title="切换到文字模式" onclick="toggleInputMode()">
+                    ⌨️
+                </button>
                 <select id="micSelect" class="device-select" title="选择麦克风设备">
                     <option value="">加载设备中...</option>
                 </select>
-                <div class="status-badge">● 监听中</div>
+                <div id="statusBadge" class="status-badge">● 监听中</div>
             </div>
             
             <button class="btn-update" onclick="alert('触发更新知识库...')">
@@ -432,6 +511,14 @@
             <!-- 填充底部空间，确保内容不被麦克风遮挡 -->
             <div style="height: 20px;"></div>
 
+        </div>
+
+        <!-- 底部输入框 (文字模式) -->
+        <div class="text-input-area hidden" id="textInputArea">
+            <textarea id="messageInput" class="text-input" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
+            <button id="sendBtn" class="btn-send" onclick="sendText()">
+                <span style="margin-right: 6px;">📤</span> 发送
+            </button>
         </div>
     </div>
 
@@ -746,6 +833,77 @@
                 backend.trigger_update_kb();
             }
         };
+
+        // --- Text/Voice Mode Switching ---
+        let isTextMode = false;
+        // Elements
+        const statusBadgeElement = document.getElementById('statusBadge');
+        const textInputAreaElement = document.getElementById('textInputArea');
+        const modeToggleBtnElement = document.getElementById('modeToggleBtn');
+        const messageInputElement = document.getElementById('messageInput');
+        const floatingMicElement = document.querySelector('.floating-mic-container'); 
+
+        function toggleInputMode() {
+            isTextMode = !isTextMode;
+            
+            if (backend) {
+                backend.trigger_switch_mode(isTextMode ? 'text' : 'voice');
+            }
+            
+            if (isTextMode) {
+                // Switch to Text Mode
+                if(micSelect) micSelect.classList.add('hidden');
+                if(statusBadgeElement) statusBadgeElement.classList.add('hidden');
+                if(floatingMicElement) floatingMicElement.classList.add('hidden');
+                
+                textInputAreaElement.classList.remove('hidden');
+                
+                modeToggleBtnElement.innerHTML = '🎙️'; 
+                modeToggleBtnElement.title = "切换到语音模式";
+                
+                // Focus input
+                setTimeout(() => messageInputElement.focus(), 100);
+            } else {
+                // Switch to Voice Mode
+                if(micSelect) micSelect.classList.remove('hidden');
+                if(statusBadgeElement) statusBadgeElement.classList.remove('hidden');
+                if(floatingMicElement) floatingMicElement.classList.remove('hidden');
+                
+                textInputAreaElement.classList.add('hidden');
+                
+                modeToggleBtnElement.innerHTML = '⌨️'; 
+                modeToggleBtnElement.title = "切换到文字模式";
+            }
+            scrollToBottom();
+        }
+
+        function sendText() {
+            const text = messageInputElement.value.trim();
+            if (!text) return;
+            
+            // Add user message to UI immediately
+            addUserMessage(text);
+            
+            if (backend) {
+                backend.trigger_text_input(text);
+                messageInputElement.value = '';
+                messageInputElement.style.height = '42px'; // Reset height
+            }
+        }
+
+        // Auto-resize textarea
+        messageInputElement.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = (this.scrollHeight) + 'px';
+        });
+
+        // Handle Enter to send
+        messageInputElement.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendText();
+            }
+        });
 
     </script>
 </body>

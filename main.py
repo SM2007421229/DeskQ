@@ -28,6 +28,8 @@ os.environ["QTWEBENGINE_REMOTE_DEBUGGING_PORT"] = "8333"
 class Backend(QObject):
     update_kb_signal = pyqtSignal()
     select_device_signal = pyqtSignal(str)
+    text_input_signal = pyqtSignal(str)
+    switch_mode_signal = pyqtSignal(str)
 
     @pyqtSlot()
     def trigger_update_kb(self):
@@ -38,6 +40,16 @@ class Backend(QObject):
     def trigger_select_device(self, device_name):
         print(f"Backend: Device selected from JS: {device_name}")
         self.select_device_signal.emit(device_name)
+
+    @pyqtSlot(str)
+    def trigger_text_input(self, text):
+        print(f"Backend: Text input received: {text}")
+        self.text_input_signal.emit(text)
+
+    @pyqtSlot(str)
+    def trigger_switch_mode(self, mode):
+        print(f"Backend: Switch mode triggered: {mode}")
+        self.switch_mode_signal.emit(mode)
 
 class CustomTitleBar(QWidget):
     def __init__(self, parent=None):
@@ -318,6 +330,8 @@ class AudioRecorder(QWidget):
         self.backend = Backend()
         self.backend.update_kb_signal.connect(self.update_knowledge_base)
         self.backend.select_device_signal.connect(self.change_device)
+        self.backend.text_input_signal.connect(self.handle_text_input_from_js)
+        self.backend.switch_mode_signal.connect(self.handle_mode_switch)
 
         self.init_ui()
 
@@ -765,6 +779,46 @@ class AudioRecorder(QWidget):
         if self.tts_handler:
             self.tts_handler.stop_audio()
     
+    def handle_mode_switch(self, mode):
+        print(f"Handling mode switch: {mode}")
+        if mode == 'text':
+            # Stop listening
+            if self.listener:
+                self.listener.stop()
+                self.listener.wait()
+                self.listener = None
+            self.handle_status_update("已暂停监听 (文字模式)")
+        elif mode == 'voice':
+            # Resume listening
+            self.start_listening()
+
+    def handle_text_input_from_js(self, text):
+        """处理来自前端的文本输入"""
+        if not text:
+            return
+        threading.Thread(target=self.process_text_input, args=(text,)).start()
+
+    def process_text_input(self, text):
+        """直接处理文本输入（跳过唤醒词检查）"""
+        try:
+            try:
+                self.update_chat_signal.emit("回答: ")  # 新行起始
+
+                # 使用 self.ai_assistant 进行流式对话
+                generator = self.ai_assistant.ask_stream(text, session_id="user_main_session")
+
+                for chunk in generator:
+                    self.update_chat_signal.emit(f"[STREAM]{chunk}")
+
+                self.update_chat_signal.emit("\n")  # 消息结束
+
+            except Exception as e:
+                print(f"\n小助手发生错误: {e}")
+                self.update_chat_signal.emit(f"Error: {e}")
+
+        except Exception as e:
+            print(f"Text processing error: {e}")
+
     def closeEvent(self, event):
         """窗口关闭事件处理"""
         self.stop_all_audio()

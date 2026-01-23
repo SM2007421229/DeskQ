@@ -7,9 +7,9 @@ langchain
 langchain-openai
 langchain-community
 langchain-core
-python-docx
+langchain-text-splitters
 pypdf
-scikit-learn
+pdfplumber
 pandas
 openpyxl
 xlrd

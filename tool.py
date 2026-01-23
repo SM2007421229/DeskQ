@@ -157,7 +157,7 @@ def get_tools():
     Dependencies are handled internally by importing file_manager.
     """
 
-    def query_files(query: str = "") -> str:
+    def query_files(query: str = "", limit: int = 50, filter_key: str = None) -> str:
         """
         Hybrid Retrieval: Vector Search + BM25 + File Name Match
         With Re-ranking logic.
@@ -167,6 +167,10 @@ def get_tools():
             return "File Manager is not initialized."
 
         try:
+            # 安全限制：最大不超过 2000
+            if limit > 2000: limit = 2000
+            if limit < 1: limit = 50
+
             query_text = query
             if isinstance(query, dict):
                 query_text = query.get('query', '') or query.get('text', '') or ''
@@ -176,6 +180,20 @@ def get_tools():
                 
             if not fm.es:
                 return "Elasticsearch 未连接。"
+
+            # Construct Filter Conditions (applied to both Vector and Keyword search)
+            filter_conditions = []
+            if filter_key:
+                keywords = filter_key.split()
+                for k in keywords:
+                    # Each keyword must match either content or file_name
+                    filter_conditions.append({
+                        "multi_match": {
+                            "query": k,
+                            "fields": ["content", "file_name"],
+                            # "type": "phrase" # Relaxed to default (best_fields) for better recall
+                        }
+                    })
 
             # 1. Vector Search (Semantic)
             # Use input_type="QUERY" for searching
@@ -187,9 +205,14 @@ def get_tools():
             vec_resp = None
             if not is_zero_vector and fm.es.indices.exists(index=fm.index_name):
                 try:
+                    # Base vector query (match_all if no filter)
+                    vector_base_query = {"match_all": {}}
+                    if filter_conditions:
+                        vector_base_query = {"bool": {"must": filter_conditions}}
+
                     vector_query = {
                         "script_score": {
-                            "query": {"match_all": {}},
+                            "query": vector_base_query,
                             "script": {
                                 "source": "cosineSimilarity(params.query_vector, doc['content_vector']) + 1.0",
                                 "params": {"query_vector": query_vector}
@@ -200,7 +223,7 @@ def get_tools():
                     # Path A: Vector Candidates
                     vec_resp = fm.es.search(
                         index=fm.index_name,
-                        body={"query": vector_query, "size": 50, "_source": ["file_name", "path", "content", "chunk_id", "chunk_seq", "parent_id", "ancestor_ids", "level", "type"]}
+                        body={"query": vector_query, "size": limit, "_source": ["file_name", "path", "content", "chunk_id", "chunk_seq", "parent_id", "ancestor_ids", "level", "type"]}
                     )
                 except Exception as e:
                     print(f"Vector search failed: {e}")
@@ -209,20 +232,29 @@ def get_tools():
                 print("Warning: Generated query vector is all zeros. Skipping vector search.")
 
             # 2. BM25 Search (Keyword) - Content and Filename
-            keyword_query = {
-                "bool": {
-                    "should": [
-                        {"match": {"content": {"query": query_text, "boost": 1.0}}},
-                        {"match": {"file_name": {"query": query_text, "boost": 2.0}}} # Filename match has higher boost
-                    ]
-                }
+            bool_query = {
+                "should": [
+                    {"match": {"content": {"query": query_text, "boost": 1.0}}},
+                    {"match": {"file_name": {"query": query_text, "boost": 2.0}}} # Filename match has higher boost
+                ]
             }
+            
+            if filter_conditions:
+                bool_query["must"] = filter_conditions
+
+            keyword_query = {"bool": bool_query}
             
             # Path B: Keyword Candidates
             kw_resp = fm.es.search(
                 index=fm.index_name,
-                body={"query": keyword_query, "size": 50, "_source": ["file_name", "path", "content", "chunk_id", "chunk_seq", "parent_id", "ancestor_ids", "level", "type"]}
+                body={"query": keyword_query, "size": limit, "_source": ["file_name", "path", "content", "chunk_id", "chunk_seq", "parent_id", "ancestor_ids", "level", "type"]}
             )
+
+            # Get total hits from keyword search for pagination warning
+            kw_total = 0
+            if kw_resp and 'hits' in kw_resp and 'total' in kw_resp['hits']:
+                t = kw_resp['hits']['total']
+                kw_total = t['value'] if isinstance(t, dict) else t
             
             # Fuse Results (Weighted Sum of normalized scores)
             # This is a simplified re-ranking
@@ -249,7 +281,7 @@ def get_tools():
             
             # Sort by fused score
             sorted_results = sorted(hits_map.values(), key=lambda x: x['score'], reverse=True)
-            top_results = sorted_results[:50] # Increase limit for statistical tasks
+            top_results = sorted_results[:limit] # Increase limit for statistical tasks
             
             if not top_results:
                 return "未找到相关文件。"
@@ -257,6 +289,11 @@ def get_tools():
             # Format Output
             # Return full content for LLM analysis without file-level deduplication
             output = []
+            
+            # Add total count warning
+            if kw_total > limit:
+                 output.append(f"【系统提示】检索共命中 {kw_total} 条数据，当前受限于 limit 参数仅展示前 {len(top_results)} 条。若数据量不足以支持完整统计（如求和、计数），请务必重新调用此工具并设置更大的 limit 参数（建议设为 {kw_total} 或 2000）。\n")
+            
             output.append(f"共找到 {len(top_results)} 条相关数据：\n")
             
             for i, res in enumerate(top_results):
@@ -389,7 +426,7 @@ def get_tools():
         StructuredTool.from_function(
             func=query_files,
             name="query_files",
-            description="Search for files in the knowledge base. MUST be used when user asks for specific data, reports, 'what files do I have', or when a calculation requires external data. If query is empty, lists all files."
+            description="Search for files in the knowledge base. MUST be used when user asks for specific data, reports, 'what files do I have', or when a calculation requires external data. If query is empty, lists all files. param 'limit' (default 50): When the user's question involves a large scope of data statistics (e.g., 'all data', 'annual total', 'summary of 2025'), set this parameter to a larger value (e.g., 500 or 1000, max 2000) to ensure data completeness. The tool output will indicate if there are more matches than the limit; if so, you MUST re-query with a larger limit for accurate aggregation. param 'filter_key' (optional): Use this to enforce strict filtering. If the user specifies explicit conditions (e.g., 'East Region', '2025', 'Product A'), put these keywords here (space-separated). Only files containing ALL these keywords will be retrieved. This avoids irrelevant data (e.g., 'South Region' data appearing in 'East Region' query) from polluting the results."
         ),
         StructuredTool.from_function(
             func=fetch_section_content,

@@ -6,14 +6,186 @@ import statistics
 from langchain_core.tools import StructuredTool
 import file_manager
 
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import uuid
+
+# Set matplotlib backend to Agg for headless environments
+plt.switch_backend('Agg')
+# Support Chinese characters in plots
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS'] 
+plt.rcParams['axes.unicode_minus'] = False
+
 # --- Calculation Tools ---
 
-def calc_sum_desc(numerical_sequence: list) -> str:
+def _resolve_absolute_path(rel_path: str) -> str:
+    """Resolve relative path to absolute using monitored folders from config.json"""
+    if os.path.isabs(rel_path) and os.path.exists(rel_path):
+        return rel_path
+
+    try:
+        # config.json is in the same directory as this script
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+        
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+            monitored_folders = config.get('file_knowledge', {}).get('monitored_folders', [])
+            
+            for folder in monitored_folders:
+                abs_path_candidate = os.path.join(folder, rel_path)
+                if os.path.exists(abs_path_candidate):
+                    return os.path.normpath(abs_path_candidate)
+            
+            return rel_path # Fallback
+    except Exception as e:
+        print(f"Error resolving path: {e}")
+        return rel_path
+
+def _read_excel_column(file_path: str, column_name: str, filter_conditions: str = None) -> list:
     """
-    接收单参数“数值序列”，对给定序列求和并返回结果与精度说明
+    Helper to read a specific column from Excel with optional filtering.
+    filter_conditions: JSON string, e.g. '{"Region": "East China", "Year": 2025}'
     """
     try:
-        nums = [float(x) for x in numerical_sequence if x is not None]
+        # Resolve path
+        file_path = _resolve_absolute_path(file_path)
+        
+        if not os.path.exists(file_path):
+            return []
+        
+        df = pd.read_excel(file_path)
+        
+        # Normalize column names for easier matching
+        # Map lowercased/stripped name to actual name
+        col_map = {str(c).strip().lower(): c for c in df.columns}
+        
+        # Apply filters if present
+        if filter_conditions:
+            try:
+                filters = json.loads(filter_conditions)
+                for key, value in filters.items():
+                    # Find the actual column name for the filter key
+                    key_norm = str(key).strip().lower()
+                    if key_norm in col_map:
+                        actual_key = col_map[key_norm]
+                        # Apply filter
+                        # Handle type conversion loosely?
+                        # For now, strict equality. 
+                        # Note: value from JSON might be int/str, df content might be different.
+                        # We convert df column to string for comparison if needed?
+                        # Or just let pandas handle it.
+                        # Let's try direct comparison first, but be aware of type mismatches.
+                        
+                        # Better approach for mixed types: convert both to string for comparison if direct fails?
+                        # But numerical comparison is important (2025 vs "2025").
+                        # Let's try standard pandas filtering.
+                        df = df[df[actual_key] == value]
+                    else:
+                        print(f"Warning: Filter column '{key}' not found in Excel.")
+            except json.JSONDecodeError:
+                print(f"Error parsing filter_conditions: {filter_conditions}")
+            except Exception as e:
+                print(f"Error applying filters: {e}")
+
+        # Find target column
+        target_col = None
+        target_norm = str(column_name).strip().lower()
+        if target_norm in col_map:
+            target_col = col_map[target_norm]
+        
+        if target_col:
+            return df[target_col].tolist()
+        else:
+            return []
+    except Exception as e:
+        print(f"Error reading excel column {column_name}: {e}")
+        return []
+
+def get_column_values(file_path: str, column_name: str) -> str:
+    """
+    获取 Excel 文件中指定列的所有去重值（用于后续的批量统计）。
+    返回去重后的值列表。
+    """
+    try:
+        file_path = _resolve_absolute_path(file_path)
+        if not os.path.exists(file_path):
+            return "File not found"
+        
+        df = pd.read_excel(file_path)
+        col_map = {str(c).strip().lower(): c for c in df.columns}
+        target_norm = str(column_name).strip().lower()
+        
+        if target_norm in col_map:
+            target_col = col_map[target_norm]
+            # Get unique values, drop NA
+            values = df[target_col].dropna().unique().tolist()
+            # Convert to appropriate types (str/int/float)
+            return json.dumps(values, default=str)
+        else:
+            return "Column not found"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def calc_sum_desc(file_path: str, column_name: str, filter_conditions: str = None) -> str:
+    """
+    计算 Excel 文件中指定列的数值总和。
+    参数 filter_conditions (可选): JSON 字符串格式的筛选条件。
+    **新特性**：支持在筛选条件中传入列表（如 `{"大区": ["华东", "华北"]}`），工具将批量计算并返回每个值的统计结果字典。
+    """
+    try:
+        filters = json.loads(filter_conditions) if filter_conditions else {}
+        
+        # Check for list values in filters (Batch Mode)
+        list_keys = [k for k, v in filters.items() if isinstance(v, list)]
+        
+        if list_keys:
+            # Batch Mode Implementation (Optimized: Read once)
+            file_path = _resolve_absolute_path(file_path)
+            if not os.path.exists(file_path):
+                return json.dumps({})
+            
+            df = pd.read_excel(file_path)
+            col_map = {str(c).strip().lower(): c for c in df.columns}
+            
+            # Apply fixed filters (non-list)
+            for k, v in filters.items():
+                if k not in list_keys:
+                    k_norm = str(k).strip().lower()
+                    if k_norm in col_map:
+                        df = df[df[col_map[k_norm]] == v]
+            
+            # Identify the batch dimension (use the first list key found)
+            target_key = list_keys[0]
+            target_vals = filters[target_key]
+            target_col_name = col_map.get(str(target_key).strip().lower())
+            
+            value_col_name = col_map.get(str(column_name).strip().lower())
+            
+            if not value_col_name:
+                return "Target column not found"
+            
+            results = {}
+            if target_col_name:
+                for val in target_vals:
+                    # Filter for specific value
+                    sub_df = df[df[target_col_name] == val]
+                    
+                    # Extract numbers safely
+                    nums = pd.to_numeric(sub_df[value_col_name], errors='coerce').dropna().tolist()
+                    
+                    if not nums:
+                        results[val] = 0
+                    else:
+                        total = sum(nums)
+                        # Simple rounding for display
+                        results[val] = round(total, 2)
+            
+            return json.dumps(results)
+
+        # Original Single Mode Logic
+        numerical_sequence = _read_excel_column(file_path, column_name, filter_conditions)
+        nums = [float(x) for x in numerical_sequence if x is not None and str(x).replace('.','',1).isdigit()]
         if not nums:
             return json.dumps({"sum": 0, "precision": 0})
         
@@ -35,12 +207,57 @@ def calc_sum_desc(numerical_sequence: list) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-def calc_mean_desc(numerical_sequence: list) -> str:
+def calc_mean_desc(file_path: str, column_name: str, filter_conditions: str = None) -> str:
     """
-    同样只需一个“数值序列”，自动过滤空值后算算术平均
+    计算 Excel 文件中指定列的算术平均值。
+    参数 filter_conditions (可选): JSON 字符串格式的筛选条件。
+    **新特性**：支持在筛选条件中传入列表，工具将批量计算并返回每个值的统计结果字典。
     """
     try:
-        nums = [float(x) for x in numerical_sequence if x is not None]
+        filters = json.loads(filter_conditions) if filter_conditions else {}
+        
+        # Check for list values in filters (Batch Mode)
+        list_keys = [k for k, v in filters.items() if isinstance(v, list)]
+        
+        if list_keys:
+            # Batch Mode Implementation
+            file_path = _resolve_absolute_path(file_path)
+            if not os.path.exists(file_path):
+                return json.dumps({})
+            
+            df = pd.read_excel(file_path)
+            col_map = {str(c).strip().lower(): c for c in df.columns}
+            
+            # Apply fixed filters
+            for k, v in filters.items():
+                if k not in list_keys:
+                    k_norm = str(k).strip().lower()
+                    if k_norm in col_map:
+                        df = df[df[col_map[k_norm]] == v]
+            
+            target_key = list_keys[0]
+            target_vals = filters[target_key]
+            target_col_name = col_map.get(str(target_key).strip().lower())
+            value_col_name = col_map.get(str(column_name).strip().lower())
+            
+            if not value_col_name:
+                return "Target column not found"
+            
+            results = {}
+            if target_col_name:
+                for val in target_vals:
+                    sub_df = df[df[target_col_name] == val]
+                    nums = pd.to_numeric(sub_df[value_col_name], errors='coerce').dropna().tolist()
+                    if not nums:
+                        results[val] = 0.0
+                    else:
+                        mean_val = statistics.mean(nums)
+                        results[val] = round(mean_val, 2)
+            return json.dumps(results)
+
+        # Original Single Mode Logic
+        numerical_sequence = _read_excel_column(file_path, column_name, filter_conditions)
+        nums = [float(x) for x in numerical_sequence if x is not None and str(x).replace('.','',1).isdigit()]
         if not nums:
             return json.dumps({"mean": 0.0})
         mean_val = statistics.mean(nums)
@@ -48,12 +265,14 @@ def calc_mean_desc(numerical_sequence: list) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-def calc_percentile_desc(numerical_sequence: list, percentile: float) -> str:
+def calc_percentile_desc(file_path: str, column_name: str, percentile: float, filter_conditions: str = None) -> str:
     """
-    需两个参数，先给“数值序列”再给出 0–100 的百分位
+    计算 Excel 文件中指定列的百分位数（如 95%）。
+    参数 filter_conditions (可选): JSON 字符串格式的筛选条件，例如 '{"大区": "华东", "季度": "2025Q1"}'
     """
     try:
-        nums = sorted([float(x) for x in numerical_sequence if x is not None])
+        numerical_sequence = _read_excel_column(file_path, column_name, filter_conditions)
+        nums = sorted([float(x) for x in numerical_sequence if x is not None and str(x).replace('.','',1).isdigit()])
         if not nums:
             return json.dumps({"percentile": 0.0})
         
@@ -73,34 +292,63 @@ def calc_percentile_desc(numerical_sequence: list, percentile: float) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-def calc_growth_rate_desc(previous_value: float, current_value: float) -> str:
+def calc_growth_rate_desc(data: str) -> str:
     """
-    接收“上期值”和“本期值”两个数值，输出同比增长率
+    计算一组数据的逐期增长率。
+    参数 data: JSON 字符串格式的数值列表，例如 '[100, 120, 150]'。
     """
     try:
-        prev = float(previous_value)
-        curr = float(current_value)
-        if prev == 0:
-            return json.dumps({"growth_rate": 0.0}) # Handle divide by zero
-        rate = ((curr - prev) / prev) * 100
-        return json.dumps({"growth_rate": rate})
+        values = json.loads(data) if isinstance(data, str) else data
+        
+        if not isinstance(values, list):
+            return "Error: Input must be a list"
+            
+        if len(values) < 2:
+            return json.dumps([])
+
+        rates = []
+        for i in range(1, len(values)):
+            try:
+                prev = float(values[i-1])
+                curr = float(values[i])
+                
+                if prev == 0:
+                    rates.append(0.0)
+                else:
+                    rate = ((curr - prev) / prev) * 100
+                    rates.append(round(rate, 2))
+            except (ValueError, TypeError):
+                rates.append(0.0)
+                
+        return json.dumps(rates)
     except Exception as e:
         return f"Error: {str(e)}"
 
-def calc_ratio_desc(numerator_sequence: list, denominator_sequence: list) -> str:
+def calc_ratio_desc(file_path: str, numerator_col: str, denominator_col: str, filter_conditions: str = None) -> str:
     """
-    也取两个参数，即“分子序列”与“分母序列”，逐元素算比例
+    计算 Excel 中两列数据的逐行比例（分子列 / 分母列）。
+    参数 filter_conditions (可选): JSON 字符串格式的筛选条件，例如 '{"大区": "华东", "季度": "2025Q1"}'
     """
     try:
-        nums = [float(x) if x is not None else 0 for x in numerator_sequence]
-        dens = [float(x) if x is not None else 1 for x in denominator_sequence]
+        nums = _read_excel_column(file_path, numerator_col, filter_conditions)
+        dens = _read_excel_column(file_path, denominator_col, filter_conditions)
+        
+        # Align lengths
+        min_len = min(len(nums), len(dens))
+        nums = nums[:min_len]
+        dens = dens[:min_len]
         
         ratios = []
         for n, d in zip(nums, dens):
-            if d == 0:
+            try:
+                n_val = float(n) if n is not None else 0
+                d_val = float(d) if d is not None else 0
+                if d_val == 0:
+                    ratios.append(None)
+                else:
+                    ratios.append(n_val / d_val)
+            except:
                 ratios.append(None)
-            else:
-                ratios.append(n / d)
                 
         return json.dumps({"ratio": ratios})
     except Exception as e:
@@ -108,7 +356,7 @@ def calc_ratio_desc(numerator_sequence: list, denominator_sequence: list) -> str
 
 def calc_round_desc(value: float, decimals: int) -> str:
     """
-    需要“数值”和“保留小数位”两个参数，按指定位数四舍五入并以字符串形式返回
+    对数值进行四舍五入。
     """
     try:
         val = float(value)
@@ -122,7 +370,7 @@ def calc_round_desc(value: float, decimals: int) -> str:
 
 def calc_cagr_desc(start_value: float, end_value: float, years: float) -> str:
     """
-    要求三个参数，依次为“起始值、结束值、年数”，计算复合年均增长率
+    计算复合年均增长率 (CAGR)。
     """
     try:
         start = float(start_value)
@@ -137,12 +385,14 @@ def calc_cagr_desc(start_value: float, end_value: float, years: float) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-def calc_std_desc(numerical_sequence: list) -> str:
+def calc_std_desc(file_path: str, column_name: str, filter_conditions: str = None) -> str:
     """
-    仅接收一个“数值序列”，计算样本标准差并保留四位小数
+    计算 Excel 文件中指定列的标准差。
+    参数 filter_conditions (可选): JSON 字符串格式的筛选条件，例如 '{"大区": "华东", "季度": "2025Q1"}'
     """
     try:
-        nums = [float(x) for x in numerical_sequence if x is not None]
+        numerical_sequence = _read_excel_column(file_path, column_name, filter_conditions)
+        nums = [float(x) for x in numerical_sequence if x is not None and str(x).replace('.','',1).isdigit()]
         if len(nums) < 2:
             return json.dumps({"std": 0.0})
             
@@ -157,19 +407,20 @@ def get_tools():
     Dependencies are handled internally by importing file_manager.
     """
 
-    def query_files(query: str = "", limit: int = 50, filter_key: str = None) -> str:
+    def query_files(query: str = "", filter_key: str = None) -> str:
         """
-        Hybrid Retrieval: Vector Search + BM25 + File Name Match
-        With Re-ranking logic.
+        Retrieves relevant document content or file schemas.
+        - For PDF/Word/Text: Returns relevant text snippets for QA.
+        - For Excel: Returns the FILE PATH, TABLE SCHEMA (columns), and SAMPLE DATA only.
+          DO NOT use this tool to get full Excel data rows.
+          Use calculation tools (calc_*) with the file path to perform data analysis.
         """
         fm = file_manager.instance
         if not fm:
             return "File Manager is not initialized."
 
         try:
-            # 安全限制：最大不超过 2000
-            if limit > 2000: limit = 2000
-            if limit < 1: limit = 50
+            limit = 50 # Default limit for text snippets
 
             query_text = query
             if isinstance(query, dict):
@@ -250,12 +501,6 @@ def get_tools():
                 body={"query": keyword_query, "size": limit, "_source": ["file_name", "path", "content", "chunk_id", "chunk_seq", "parent_id", "ancestor_ids", "level", "type"]}
             )
 
-            # Get total hits from keyword search for pagination warning
-            kw_total = 0
-            if kw_resp and 'hits' in kw_resp and 'total' in kw_resp['hits']:
-                t = kw_resp['hits']['total']
-                kw_total = t['value'] if isinstance(t, dict) else t
-            
             # Fuse Results (Weighted Sum of normalized scores)
             # This is a simplified re-ranking
             hits_map = {} # path_chunk_id -> {score, hit}
@@ -281,30 +526,26 @@ def get_tools():
             
             # Sort by fused score
             sorted_results = sorted(hits_map.values(), key=lambda x: x['score'], reverse=True)
-            top_results = sorted_results[:limit] # Increase limit for statistical tasks
+            top_results = sorted_results[:limit]
             
             if not top_results:
                 return "未找到相关文件。"
                 
             # Format Output
-            # Return full content for LLM analysis without file-level deduplication
             output = []
-            
-            # Add total count warning
-            if kw_total > limit:
-                 output.append(f"【系统提示】检索共命中 {kw_total} 条数据，当前受限于 limit 参数仅展示前 {len(top_results)} 条。若数据量不足以支持完整统计（如求和、计数），请务必重新调用此工具并设置更大的 limit 参数（建议设为 {kw_total} 或 2000）。\n")
             
             output.append(f"共找到 {len(top_results)} 条相关数据：\n")
             
             for i, res in enumerate(top_results):
                 src = res['source']
                 name = src['file_name']
+                path = src.get('path', name)
                 content = src['content'] # Return full content
                 
                 chunk_id = src.get('chunk_id')
                 
-                # Format: [Index] ID: ... File: ... Content: ...
-                output.append(f"[{i+1}] ID: {chunk_id} 文件: {name}\n内容: {content}\n")
+                # Format: [Index] ID: ... Path: ... Content: ...
+                output.append(f"[{i+1}] ID: {chunk_id} 路径: {path}\n内容: {content}\n")
 
             return "\n".join(output)
 
@@ -341,11 +582,14 @@ def get_tools():
             hits = resp['hits']['hits']
             if hits:
                 path = hits[0]['_source']['path']
-                if os.path.exists(path):
-                    os.startfile(path)
-                    return f"已打开: {path}"
+                # Resolve relative path to absolute
+                abs_path = _resolve_absolute_path(path)
+                
+                if os.path.exists(abs_path):
+                    os.startfile(abs_path)
+                    return f"已打开: {abs_path}"
                 else:
-                     return f"文件不存在: {path}"
+                     return f"文件不存在: {abs_path}"
             return "未找到文件"
         except Exception as e:
             traceback.print_exc()
@@ -422,6 +666,140 @@ def get_tools():
             traceback.print_exc()
             return f"Error fetching section content: {str(e)}"
 
+    def plot_chart(chart_type: str, data: str, x_label: str = "", y_label: str = "", title: str = "") -> str:
+        """
+        生成 ECharts 图表配置。
+        
+        :param chart_type: 图表类型，支持 'bar' (柱状图), 'line' (折线图), 'pie' (饼图)
+        :param data: JSON 字符串格式的数据。
+                     对于 bar/line/pie: {"Category1": Value1, "Category2": Value2, ...}
+                     或者 {"labels": ["A", "B"], "values": [10, 20]}
+        :param x_label: X轴标签
+        :param y_label: Y轴标签
+        :param title: 图表标题
+        :return: 包含 ECharts 配置的 JSON 字符串
+        """
+        try:
+            data_dict = json.loads(data)
+            
+            labels = []
+            values = []
+
+            # Normalize data format to labels and values
+            if isinstance(data_dict, list):
+                # Handle list input e.g. [{"name": "A", "value": 10}, ...] or [{"A": 10}, {"B": 20}]
+                if not data_dict:
+                     return "Error: Empty data list."
+                
+                first_item = data_dict[0]
+                if isinstance(first_item, dict):
+                    keys = list(first_item.keys())
+                    # Heuristic: look for common value keys
+                    val_key = next((k for k in keys if str(k).lower() in ['value', 'values', 'count', 'amount', 'num', 'number', 'sales', 'total', 'score', 'price']), None)
+                    # Heuristic: look for common label keys
+                    lbl_key = next((k for k in keys if str(k).lower() in ['name', 'label', 'category', 'type', 'x', 'date', 'year', 'quarter', 'month', 'day', 'region', 'city']), None)
+                    
+                    if val_key and lbl_key:
+                        for item in data_dict:
+                            labels.append(item.get(lbl_key, ''))
+                            values.append(item.get(val_key, 0))
+                    elif len(keys) == 1: 
+                        # Assume [{"A": 10}, {"B": 20}] format
+                         for item in data_dict:
+                             k = list(item.keys())[0]
+                             labels.append(k)
+                             values.append(item[k])
+                    else:
+                        # Fallback: Use first key as label, last key as value (often ordered dicts)
+                        # Or if we have 2 keys, assume 0 is label, 1 is value
+                        if len(keys) >= 2:
+                            lbl_key = keys[0]
+                            val_key = keys[-1] # Assume last is value (e.g. Name, ..., Value)
+                            for item in data_dict:
+                                labels.append(item.get(lbl_key, ''))
+                                values.append(item.get(val_key, 0))
+                        else:
+                             return f"Error: Could not infer labels and values from data list. Keys found: {keys}"
+                else:
+                    # List of values
+                    labels = [str(i+1) for i in range(len(data_dict))]
+                    values = data_dict
+            
+            elif isinstance(data_dict, dict):
+                if "labels" in data_dict and "values" in data_dict:
+                    labels = data_dict["labels"]
+                    values = data_dict["values"]
+                else:
+                    labels = list(data_dict.keys())
+                    values = list(data_dict.values())
+            else:
+                return "Error: Data must be a JSON object or list."
+            
+            # Ensure values are numeric
+            # values = [float(v) for v in values] # ECharts handles numbers/strings usually
+            
+            option = {
+                "title": {
+                    "text": title,
+                    "left": "center",
+                    "textStyle": {"color": "#f1f5f9"} # Default to light color for dark mode
+                },
+                "tooltip": {"trigger": "item" if chart_type == 'pie' else "axis"},
+                "legend": {
+                    "orient": "vertical",
+                    "left": "left",
+                    "textStyle": {"color": "#94a3b8"}
+                },
+                "series": []
+            }
+            
+            if chart_type in ['bar', 'line']:
+                option["xAxis"] = {
+                    "type": "category",
+                    "data": labels,
+                    "name": x_label,
+                    "axisLabel": {"color": "#94a3b8"},
+                    "axisLine": {"lineStyle": {"color": "#475569"}},
+                    "nameTextStyle": {"color": "#94a3b8"}
+                }
+                option["yAxis"] = {
+                    "type": "value",
+                    "name": y_label,
+                    "axisLabel": {"color": "#94a3b8"},
+                    "splitLine": {"lineStyle": {"color": "#334155"}},
+                    "nameTextStyle": {"color": "#94a3b8"}
+                }
+                option["series"].append({
+                    "data": values,
+                    "type": chart_type,
+                    "itemStyle": {"color": "#6366f1"} # Indigo 500
+                })
+            elif chart_type == 'pie':
+                pie_data = [{"name": str(l), "value": v} for l, v in zip(labels, values)]
+                option["series"].append({
+                    "type": "pie",
+                    "radius": "50%",
+                    "data": pie_data,
+                    "emphasis": {
+                        "itemStyle": {
+                            "shadowBlur": 10,
+                            "shadowOffsetX": 0,
+                            "shadowColor": "rgba(0, 0, 0, 0.5)"
+                        }
+                    },
+                    "label": {"color": "#f1f5f9"}
+                })
+            else:
+                return "Error: Unsupported chart type. Use 'bar', 'line', or 'pie'."
+            
+            # Return the option wrapped in markdown
+            json_str = json.dumps(option, ensure_ascii=False, indent=2)
+            return f"```echarts\n{json_str}\n```"
+            
+        except Exception as e:
+            traceback.print_exc()
+            return f"Error generating chart: {str(e)}"
+
     return [
         StructuredTool.from_function(
             func=query_files,
@@ -439,29 +817,34 @@ def get_tools():
             description="Open a specific file in the local OS (e.g. launch PDF viewer). DO NOT use this tool to read/analyze content. Only use when user explicitly asks to 'open' or 'launch' a file."
         ),
         StructuredTool.from_function(
+            func=get_column_values,
+            name="get_column_values",
+            description="获取Excel文件某一列的所有去重值。参数：file_path(文件路径), column_name(列名)。使用场景：当用户询问'有哪些大区'、'统计各产品销售额'时，先调用此工具获取所有类别（如所有大区名），然后将这些类别列表作为filter_conditions的值传给统计工具进行批量计算。"
+        ),
+        StructuredTool.from_function(
             func=calc_sum_desc,
             name="calc_sum_desc",
-            description="接收单参数“数值序列”，对给定序列求和并返回结果与精度说明"
+            description="计算Excel文件中指定列的数值总和。参数：file_path(文件路径), column_name(列名), filter_conditions(可选，JSON格式筛选条件)。新特性：支持在筛选条件中传入列表（如 {'大区': ['华东', '华北']}），工具将批量计算并返回每个值的统计结果字典。"
         ),
         StructuredTool.from_function(
             func=calc_mean_desc,
             name="calc_mean_desc",
-            description="同样只需一个“数值序列”，自动过滤空值后算算术平均"
+            description="计算Excel文件中指定列的算术平均值。参数：file_path(文件路径), column_name(列名), filter_conditions(可选，JSON格式筛选条件)。新特性：支持在筛选条件中传入列表，工具将批量计算并返回每个值的统计结果字典。"
         ),
         StructuredTool.from_function(
             func=calc_percentile_desc,
             name="calc_percentile_desc",
-            description="需两个参数，先给“数值序列”再给出 0–100 的百分位"
+            description="计算Excel文件中指定列的百分位数。参数：file_path(文件路径), column_name(列名), percentile(0-100), filter_conditions(可选，JSON格式筛选条件)。"
         ),
         StructuredTool.from_function(
             func=calc_growth_rate_desc,
             name="calc_growth_rate_desc",
-            description="接收“上期值”和“本期值”两个数值，输出同比增长率"
+            description="计算一组数据的逐期增长率。参数 data: JSON 字符串格式的数值列表（如 '[100, 120, 150]'）。返回对应的增长率列表（如 '[20.0, 25.0]'）。"
         ),
         StructuredTool.from_function(
             func=calc_ratio_desc,
             name="calc_ratio_desc",
-            description="也取两个参数，即“分子序列”与“分母序列”，逐元素算比例"
+            description="计算Excel中两列数据的逐行比例（分子列/分母列）。参数：file_path(文件路径), numerator_col(分子列名), denominator_col(分母列名), filter_conditions(可选，JSON格式筛选条件)。"
         ),
         StructuredTool.from_function(
             func=calc_round_desc,
@@ -476,6 +859,11 @@ def get_tools():
         StructuredTool.from_function(
             func=calc_std_desc,
             name="calc_std_desc",
-            description="计算样本标准差。当需要分析数据波动、稳定性或标准差时调用。参数：numerical_sequence(数值序列)。"
+            description="计算Excel文件中指定列的标准差。参数：file_path(文件路径), column_name(列名), filter_conditions(可选，JSON格式筛选条件)。"
+        ),
+        StructuredTool.from_function(
+            func=plot_chart,
+            name="plot_chart",
+            description="生成ECharts图表配置。参数：chart_type('bar'|'line'|'pie'), data(JSON字符串), x_label, y_label, title。当用户要求'画图'、'可视化'时使用此工具。注意：工具会返回一段JSON配置代码，你必须将这段代码完整包含在你的最终回答中（包裹在```echarts ... ```代码块内）。严禁在代码块后添加任何解释性文字（如“注：...”）。"
         )
     ]

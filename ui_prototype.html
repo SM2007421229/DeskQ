@@ -524,6 +524,7 @@
 
     <script src="js/qwebchannel.js"></script>
     <script src="js/marked.min.js"></script>
+    <script src="js/echarts.min.js"></script>
     
     <!-- MathJax 3 Configuration -->
     <script>
@@ -553,6 +554,19 @@
         const renderer = new marked.Renderer();
         renderer.code = function(code, language) {
             const lang = (language || 'text').trim();
+            
+            if (lang === 'echarts') {
+                const chartId = 'chart_' + Math.random().toString(36).substr(2, 9);
+                // Use encodeURIComponent to safely store JSON in attribute
+                const encodedOption = encodeURIComponent(code);
+                return `
+                <div class="echarts-chart-container" 
+                     id="${chartId}" 
+                     style="width: 100%; height: 400px; margin: 12px 0; border: 1px solid #334155; border-radius: 8px;"
+                     data-option="${encodedOption}">
+                </div>`;
+            }
+
             // Escape code to prevent HTML injection
             const escapedCode = code.replace(/&/g, "&amp;")
                                     .replace(/</g, "&lt;")
@@ -767,9 +781,152 @@
 
         function endAiMessage() {
             // 最终渲染：在消息接收完毕后统一渲染公式，确保稳定性
-            if (currentAiDetail && window.MathJax && window.MathJax.typesetPromise) {
-                 window.MathJax.typesetPromise([currentAiDetail])
-                    .catch((err) => console.log('MathJax final render error:', err));
+            if (currentAiDetail) {
+                if (window.MathJax && window.MathJax.typesetPromise) {
+                     window.MathJax.typesetPromise([currentAiDetail])
+                        .catch((err) => console.log('MathJax final render error:', err));
+                }
+
+                // Initialize ECharts
+                const charts = currentAiDetail.querySelectorAll('.echarts-chart-container');
+                charts.forEach(container => {
+                    if (container.getAttribute('data-initialized') === 'true') return;
+                    
+                    try {
+                        const optionStr = decodeURIComponent(container.getAttribute('data-option'));
+                        let option;
+                        try {
+                            option = JSON.parse(optionStr);
+                        } catch (e) {
+                            console.warn("Standard JSON parse failed, attempting JS evaluation (for functions/comments)...");
+                            // Allow non-strict JSON (e.g. unquoted keys, functions)
+                            // This enables ECharts features like formatter functions and color callbacks
+                            option = new Function('return ' + optionStr)();
+                        }
+                        
+                        // --- Auto-Correction Logic for Parameter-Style Output ---
+                        // Check if the LLM outputted tool parameters (chart_type, data, etc.) instead of an ECharts option
+                        if (option.chart_type && (typeof option.title === 'string')) {
+                            console.warn("Detected parameter-style JSON from LLM, auto-converting to ECharts option...");
+                            
+                            // 1. Parse Data
+                            let labels = [];
+                            let values = [];
+                            let rawData = option.data;
+                            
+                            try {
+                                if (typeof rawData === 'string') {
+                                    rawData = JSON.parse(rawData);
+                                }
+                                
+                                if (Array.isArray(rawData)) {
+                                     // Handle list input e.g. [{"name": "A", "value": 10}]
+                                     if (rawData.length > 0) {
+                                        const firstItem = rawData[0];
+                                        const keys = Object.keys(firstItem);
+                                        // Heuristic matching
+                                        const valKey = keys.find(k => ['value', 'values', 'count', 'amount', 'num', 'number', 'sales', 'total', 'score', 'price'].includes(k.toLowerCase())) || keys[keys.length-1];
+                                        const lblKey = keys.find(k => ['name', 'label', 'category', 'type', 'x', 'date', 'year', 'quarter', 'month', 'day', 'region', 'city'].includes(k.toLowerCase())) || keys[0];
+                                        
+                                        rawData.forEach(item => {
+                                            labels.push(item[lblKey] || '');
+                                            values.push(item[valKey] || 0);
+                                        });
+                                     }
+                                } else if (typeof rawData === 'object') {
+                                     if (rawData.labels && rawData.values) {
+                                         labels = rawData.labels;
+                                         values = rawData.values;
+                                     } else {
+                                         labels = Object.keys(rawData);
+                                         values = Object.values(rawData);
+                                     }
+                                }
+                            } catch (e) {
+                                console.error("Data parsing failed during auto-correction", e);
+                            }
+                            
+                            // Fallback if parsing failed or empty
+                            if (labels.length === 0 && Array.isArray(rawData)) {
+                                 // Simple map fallback
+                                 labels = rawData.map(x => x.name || x.label || Object.keys(x)[0]);
+                                 values = rawData.map(x => x.value || Object.values(x)[0]);
+                            }
+
+                            // 2. Construct Valid Option
+                            const newOption = {
+                                title: {
+                                    text: option.title,
+                                    left: "center",
+                                    textStyle: { color: "#f1f5f9" }
+                                },
+                                tooltip: { trigger: option.chart_type === 'pie' ? "item" : "axis" },
+                                legend: {
+                                    orient: "vertical",
+                                    left: "left",
+                                    textStyle: { color: "#94a3b8" }
+                                },
+                                series: []
+                            };
+
+                            if (['bar', 'line'].includes(option.chart_type)) {
+                                newOption.xAxis = {
+                                    type: "category",
+                                    data: labels,
+                                    name: option.x_label || "",
+                                    axisLabel: { color: "#94a3b8" },
+                                    axisLine: { lineStyle: { color: "#475569" } }
+                                };
+                                newOption.yAxis = {
+                                    type: "value",
+                                    name: option.y_label || "",
+                                    axisLabel: { color: "#94a3b8" },
+                                    splitLine: { lineStyle: { color: "#334155" } }
+                                };
+                                newOption.series.push({
+                                    data: values,
+                                    type: option.chart_type,
+                                    itemStyle: { color: "#6366f1" }
+                                });
+                            } else if (option.chart_type === 'pie') {
+                                const pieData = labels.map((l, i) => ({ name: l, value: values[i] }));
+                                newOption.series.push({
+                                    type: "pie",
+                                    radius: "50%",
+                                    data: pieData,
+                                    label: { color: "#f1f5f9" }
+                                });
+                            }
+                            
+                            option = newOption; // Replace with corrected option
+                        }
+                        // -----------------------------------------------------------
+                        
+                        // Basic Dark Mode Adaptation
+                        if (!option.backgroundColor) option.backgroundColor = 'transparent';
+                        if (!option.textStyle) option.textStyle = {};
+                        if (!option.textStyle.color) option.textStyle.color = '#f1f5f9';
+
+                        // Robustness: Ensure title is an object (ECharts requirement)
+                        if (option.title && typeof option.title === 'string') {
+                            option.title = {
+                                text: option.title,
+                                left: "center",
+                                textStyle: { color: "#f1f5f9" }
+                            };
+                        }
+                        
+                        const chart = echarts.init(container);
+                        chart.setOption(option);
+                        container.setAttribute('data-initialized', 'true');
+                        
+                        // Resize handling
+                        window.addEventListener('resize', () => chart.resize());
+                    } catch (e) {
+                        console.error('Failed to init chart', e);
+                        container.innerHTML = `<div style="color:red; padding:10px;">Chart Error: ${e.message}</div>`;
+                    }
+                });
             }
             
             currentAiContainer = null;

@@ -582,9 +582,8 @@ class AudioRecorder(QWidget):
             if not hasattr(self, 'file_manager'):
                 self.file_manager = file_manager.FileManager(self.config)
 
-            self.file_manager.initialize_elasticsearch()
-            # 指定要更新的目录，这里假设是配置文件中的第一个目录，或者默认目录
-            target_dirs = self.config.get('monitor_paths', [])
+            # 指定要更新的目录
+            target_dirs = self.config.get('file_knowledge', {}).get('monitored_folders', [])
             if not target_dirs:
                 # Fallback to desktop if not configured
                 target_dirs = [os.path.join(os.path.expanduser("~"), "Desktop")]

@@ -70,7 +70,15 @@ class chat:
 
         agent = create_tool_calling_agent(self.llm, tools, self.prompt)
         # AgentExecutor 负责执行 Agent 循环
-        self.executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+        # 增加 max_iterations 防止无限循环
+        # 增加 handle_parsing_errors 防止模型输出格式错误导致崩溃
+        self.executor = AgentExecutor(
+            agent=agent, 
+            tools=tools, 
+            verbose=True,
+            max_iterations=8,
+            handle_parsing_errors=True
+        )
         
         # 包装为带历史记录管理的 Runnable
         self.runnable = RunnableWithMessageHistory(

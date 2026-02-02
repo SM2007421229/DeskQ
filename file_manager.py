@@ -382,6 +382,45 @@ class ContentExtractor:
             
         return [c.strip() for c in chunks if c.strip()]
 
+    def _process_excel(self, file_path):
+        """
+        Extracts metadata (columns, sample data) from Excel files.
+        Does NOT extract full row data to avoid token limits.
+        """
+        chunks = []
+        try:
+            # Read header and first few rows for sampling
+            df = pd.read_excel(file_path, nrows=3)
+            columns = df.columns.tolist()
+            
+            # Create a schema description
+            schema_desc = f"Columns: {', '.join(map(str, columns))}"
+            
+            # Create sample data description
+            sample_rows = []
+            for _, row in df.iterrows():
+                row_str = ", ".join([f"{col}:{val}" for col, val in row.items()])
+                sample_rows.append(f"{{ {row_str} }}")
+            
+            sample_desc = "Data Samples:\n" + "\n".join(sample_rows)
+            
+            full_content = f"Excel File Schema.\n{schema_desc}\n{sample_desc}"
+            
+            chunks.append({
+                "chunk_id": str(uuid.uuid4()),
+                "content": full_content,
+                "type": "excel_schema",
+                "file_path": file_path,
+                "columns": columns,
+                "chunk_seq": 0
+            })
+            
+        except Exception as e:
+            print(f"Error processing Excel {file_path}: {e}")
+            traceback.print_exc()
+            
+        return chunks
+
     def load_and_split(self, file_path, ext):
         """
         Extract content from file and split into chunks.
@@ -403,46 +442,7 @@ class ContentExtractor:
                     return []
 
             elif ext in ['.xlsx', '.xls']:
-                # Optimized for RAG: Row-based chunking with explicit headers
-                try:
-                    dfs = pd.read_excel(file_path, sheet_name=None)
-                    custom_chunks = []
-                    chunk_counter = 0
-                    
-                    for sheet, df in dfs.items():
-                        # Clean data
-                        df = df.fillna('')
-                        
-                        # Convert all columns to string for safe usage
-                        columns = [str(c).strip() for c in df.columns]
-                        
-                        # Add sheet context
-                        sheet_context = f"File: {os.path.basename(file_path)}, Sheet: {sheet}"
-                        
-                        for _, row in df.iterrows():
-                            # Construct semantic row representation: "Col1: Val1, Col2: Val2..."
-                            row_parts = []
-                            for col, val in zip(columns, row):
-                                val_str = str(val).strip()
-                                if val_str: # Skip empty values
-                                    row_parts.append(f"{col}: {val_str}")
-                            
-                            if not row_parts:
-                                continue
-                                
-                            row_str = f"[{sheet}] " + ", ".join(row_parts)
-                            
-                            # Strict One Row Per Chunk
-                            # Include context in every chunk for independence
-                            chunk_text = f"{sheet_context}\n{row_str}"
-                            custom_chunks.append({"content": chunk_text, "chunk_id": chunk_counter})
-                            chunk_counter += 1
-                            
-                    return custom_chunks
-                    
-                except Exception as e:
-                    print(f"Error parsing Excel {file_path}: {e}")
-                    return []
+                return self._process_excel(file_path)
 
             else:
                 return []
@@ -686,16 +686,20 @@ class FileManager:
                             full_path = os.path.normpath(full_path)
                             mtime = os.path.getmtime(full_path)
                             
+                            # Calculate relative path for storage
+                            rel_path = os.path.relpath(full_path, folder)
+                            
                             current_files[full_path] = {
                                 "name": file,
-                                "path": full_path,
+                                "path": rel_path, # Store relative path
+                                "full_path": full_path, # Keep absolute for reading
                                 "ext": ext,
                                 "mtime": mtime
                             }
             
             # 2. Get existing files metadata from ES
             # We aggregate by path to get stored mtime
-            existing_files = {} # path -> mtime
+            existing_files = {} # path (relative) -> mtime
             if self.es:
                 try:
                     # Ensure index exists
@@ -727,19 +731,23 @@ class FileManager:
                     print(f"Error fetching existing files from ES: {e}")
 
             # 3. Calculate Diff
-            files_on_disk = set(current_files.keys())
+            # Use relative paths for comparison
+            # Map relative paths back to full paths for processing
+            rel_to_full = {meta['path']: meta['full_path'] for meta in current_files.values()}
+            files_on_disk = set(rel_to_full.keys())
             files_in_index = set(existing_files.keys())
             
             to_delete = files_in_index - files_on_disk
             to_add_or_update = []
             
-            for path in files_on_disk:
-                if path not in files_in_index:
-                    to_add_or_update.append(path)
+            for rel_path in files_on_disk:
+                if rel_path not in files_in_index:
+                    to_add_or_update.append(rel_path)
                 else:
-                    # Check mtime
-                    if current_files[path]['mtime'] > existing_files[path] + 1.0: # 1s buffer
-                        to_add_or_update.append(path)
+                    # Check mtime (using full path to look up current mtime)
+                    full_p = rel_to_full[rel_path]
+                    if current_files[full_p]['mtime'] > existing_files[rel_path] + 1.0: # 1s buffer
+                        to_add_or_update.append(rel_path)
 
             # 4. Apply Deletions
             if to_delete and self.es:
@@ -754,19 +762,20 @@ class FileManager:
             if to_add_or_update and self.es:
                 print(f"Indexing {len(to_add_or_update)} files...")
                 
-                for path in to_add_or_update:
+                for rel_path in to_add_or_update:
                     try:
                         # First delete existing chunks for this file to avoid duplication
-                        if path in files_in_index:
+                        if rel_path in files_in_index:
                              self.es.delete_by_query(
                                 index=self.index_name,
-                                body={"query": {"term": {"path": path}}}
+                                body={"query": {"term": {"path": rel_path}}}
                             )
                         
-                        meta = current_files[path]
+                        full_path = rel_to_full[rel_path]
+                        meta = current_files[full_path]
                         
                         # Extract and Split
-                        chunks = self.extractor.load_and_split(path, meta['ext'])
+                        chunks = self.extractor.load_and_split(full_path, meta['ext'])
                         if not chunks:
                             continue
                             
@@ -786,7 +795,7 @@ class FileManager:
                                 "_index": self.index_name,
                                 "_source": {
                                     "file_name": meta['name'],
-                                    "path": meta['path'],
+                                    "path": meta['path'], # Relative path
                                     "ext": meta['ext'],
                                     "mtime": meta['mtime'],
                                     "content": chunk['content'],
@@ -807,7 +816,7 @@ class FileManager:
                             helpers.bulk(self.es, actions)
                             
                     except Exception as e:
-                        print(f"Failed to index {path}: {e}")
+                        print(f"Failed to index {rel_path}: {e}")
                         traceback.print_exc()
 
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Indexing completed. (+{len(to_add_or_update)}, -{len(to_delete)})")

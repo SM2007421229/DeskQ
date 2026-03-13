@@ -7,8 +7,8 @@
 
 ---
 
-<!-- 功能截图 / GIF 预留位 -->
-![demo](docs/demo.gif)
+<!-- 视频演示位 -->
+**视频演示地址**：https://www.bilibili.com/video/BV18DcDz5ETv/?vd_source=1d59dff9cac0681edee28e237821f5e9
 
 ## ✨ Functions
 
